@@ -19,7 +19,7 @@ from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QMediaDevices
 SR = 44100
 BPM_DEFAULT = 120
 STEPS = 16
-BUFFER_MS = 50
+BUFFER_MS = 100
 
 # --- Audio Streaming ---
 
@@ -347,40 +347,63 @@ class AudioMixer:
         sec_step = sec_beat / 4.0
         total_samples = int(sec_step * steps * SR)
         swing_offset = int(sec_step * swing * 0.33 * SR)
+        
+        # Buffer slightly larger for decay trails
         out = np.zeros(total_samples + int(SR * 0.5), dtype=np.float32)
 
         for s in slots:
             raw_data = s['data']
-            if raw_data is None: continue
+            if raw_data is None or len(raw_data) == 0: continue
             
+            # Optimization: Don't process massive arrays if they are clipped anyway
+            # Calculate Max Length needed for this BPM (approx 4 seconds usually)
+            max_seq_len = total_samples + int(SR * 0.5) 
+
             if clip_val > 0.0:
-                # Non-linear curve so the effect feels natural
                 keep_ratio = 1.0 - (clip_val ** 0.5)
+                # Ensure we don't slice smaller than 100 samples
                 actual_len = max(100, int(len(raw_data) * keep_ratio))
+                data = raw_data[:actual_len].copy() # Copy is safer here
                 
-                data = raw_data[:actual_len].copy()
-                
-                # Short fade out to prevent clicking
                 fade_samples = min(300, int(actual_len * 0.2))
                 if fade_samples > 0:
                     data[-fade_samples:] *= np.linspace(1, 0, fade_samples)
             else:
-                data = raw_data
+                # OPTIMIZATION: Even without clip, don't use more data than fits in the loop
+                # This prevents adding a 3-second tail to a 1-second loop unnecessarily
+                if len(raw_data) > max_seq_len:
+                     data = raw_data[:max_seq_len]
+                else:
+                     data = raw_data
 
             s_len = len(data)
+            
             for i, (active, vel) in enumerate(zip(s['pattern'], s['velocities'])):
                 if active:
                     start_pos = int(i * sec_step * SR)
                     if i % 2 != 0: start_pos += swing_offset
+                    
+                    # Bounds checking
                     if start_pos < len(out):
                         write_len = min(s_len, len(out) - start_pos)
+                        # Vectorized addition
                         out[start_pos : start_pos + write_len] += data[:write_len] * (vel ** 1.5)
         
+        # Wrap tail (Looping)
         tail = out[total_samples:]
-        out[:min(len(tail), total_samples)] += tail[:min(len(tail), total_samples)]
+        wrap_len = min(len(tail), total_samples)
+        out[:wrap_len] += tail[:wrap_len]
+        
         final = out[:total_samples]
+        
+        # Hard Limit (Clipping protection)
+        np.clip(final, -1.0, 1.0, out=final)
+        
+        # Normalize only if too loud (prevents volume pumping on quiet loops)
         peak = np.max(np.abs(final))
-        if peak > 0.95: final = final / peak * 0.95
+        if peak > 0.95: 
+            final *= (0.95 / peak)
+            
         return final
 
 # --- UI Components ---
@@ -768,20 +791,30 @@ class SlotRow(QFrame):
 
     def load_sample(self, file_path):
         try:
-            # Load file, flatten to mono, resample to SR
-            data, samplerate = sf.read(file_path)
+            # 1. Read only metadata first to check length (optimization)
+            # or just read and slice immediately.
+            data, file_sr = sf.read(file_path)
+
+            # Convert to mono if stereo
             if len(data.shape) > 1:
-                data = np.mean(data, axis=1) # Convert stereo to mono
-            
-            if samplerate != SR:
-                num_samples = int(len(data) * SR / samplerate)
+                data = np.mean(data, axis=1)
+
+            # Keep only first 3 seconds
+            max_samples = 3 * file_sr 
+            if len(data) > max_samples:
+                data = data[:max_samples]
+
+            # Resample if mismatch
+            if file_sr != SR:
+                num_samples = int(len(data) * SR / file_sr)
+                # Now resampling is fast because len(data) is small
                 data = signal.resample(data, num_samples)
             
             # Normalize
             peak = np.max(np.abs(data))
             if peak > 0: data = data / peak
             
-            # Trim silence
+            # Trim silence & declick
             data = SynthEngine.ensure_zero_crossing(data.astype(np.float32))
 
             self.raw_sample = data
@@ -799,7 +832,7 @@ class SlotRow(QFrame):
             
         except Exception as e:
             self.saved_msg.emit("load err")
-            print(e)
+            print(f"Error loading: {e}")
 
     def reset_to_synth(self):
         self.is_sample_mode = False
