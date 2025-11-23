@@ -6,7 +6,7 @@ from scipy import signal
 
 from PyQt6.QtCore import (Qt, pyqtSignal, QTimer, QRectF, QIODevice, 
                           QByteArray, QPropertyAnimation, QEasingCurve, 
-                          QPointF)
+                          QPointF, QUrl)
 from PyQt6.QtGui import (QColor, QPainter, QPen, QFont, QPainterPath, 
                          QLinearGradient, QBrush)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -133,6 +133,44 @@ class SynthEngine:
         data[:fade_len] *= fade_in
         data[-fade_len:] *= fade_out
         return data
+
+    @staticmethod
+    def process_sample(raw_data, params):
+        """Applies Pitch, Decay, and Tone to an external sample."""
+        if raw_data is None or len(raw_data) == 0:
+            return np.zeros(100, dtype=np.float32)
+
+        p_pitch = params.get('pitch', 0.5)
+        p_decay = params.get('decay', 0.5)
+        p_tone = params.get('tone', 0.5)
+
+        # 1. Pitch (Resampling)
+        # Range: 0.5x speed (low) to 2.0x speed (high)
+        speed = 0.5 + (p_pitch * 1.5)
+        new_len = int(len(raw_data) / speed)
+        if new_len < 10: new_len = 10
+        y = signal.resample(raw_data, new_len)
+
+        t = np.linspace(0, len(y) / SR, len(y))
+
+        # 2. Tone (Simple Tilt Filter)
+        # < 0.5 Lowpass, > 0.5 Highpass
+        if p_tone < 0.45:
+            cutoff = 500 + (p_tone * 8000) # 500Hz to ~4kHz
+            sos = signal.butter(1, cutoff, 'lp', fs=SR, output='sos')
+            y = signal.sosfilt(sos, y)
+        elif p_tone > 0.55:
+            cutoff = 100 + ((p_tone - 0.5) * 4000) 
+            sos = signal.butter(1, cutoff, 'hp', fs=SR, output='sos')
+            y = signal.sosfilt(sos, y)
+
+        # 3. Decay (Exponential Envelope)
+        # Map decay slider 0.0-1.0 to a decay coefficient
+        decay_coef = 0.5 + ((1.0 - p_decay) * 15) 
+        env = np.exp(-t * decay_coef)
+        y = y * env
+
+        return SynthEngine.ensure_zero_crossing(y.astype(np.float32))
 
     @staticmethod
     def generate_drum(drum_type, params):
@@ -438,8 +476,10 @@ class ClearButton(QPushButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # 1. Draw Background Circle
-        rect = QRectF(1, 1, 18, 18)
+        # Dynamic sizing based on widget dimensions
+        s = min(self.width(), self.height())
+        margin = 1
+        rect = QRectF(margin, margin, s - (margin * 2), s - (margin * 2))
         
         bg = QColor("white")
         border = QColor("#feb2b2")
@@ -455,11 +495,13 @@ class ClearButton(QPushButton):
         painter.setPen(QPen(border, 1))
         painter.drawEllipse(rect)
         
-        # 2. Draw the Dot
+        # Center dot
         painter.setBrush(dot_color)
         painter.setPen(Qt.PenStyle.NoPen)
-        cx, cy = 10.0, 10.0
-        r = 2.0 # Radius of the dot (adjusts size)
+        cx, cy = s / 2.0, s / 2.0
+        
+        # Changed from s/5.0 to s/7.0 for a smaller dot
+        r = s / 7.0 
         painter.drawEllipse(QPointF(cx, cy), r, r)
 
 class StepPad(QWidget):
@@ -572,12 +614,35 @@ class StepPad(QWidget):
         else:
             self.flash_val = 0.0
 
-class VerticalSeparator(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedWidth(1)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background-color: #cbd5e0; border: none;")
+class DraggableLabel(QLabel):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Drag & Drop audio file here (.wav, .mp3, etc)")
+        # Make it look slightly interactive
+        self.setStyleSheet("""
+            QLabel { 
+                font-size: 12px; color: #4a5568; font-weight: bold; 
+                margin-left: 2px; border: 1px dashed transparent;
+                border-radius: 4px; padding: 2px;
+            }
+            QLabel:hover { background-color: #ebf8ff; border-color: #90cdf4; color: #2b6cb0; }
+        """)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            self.file_dropped.emit(path)
 
 class SlotRow(QFrame):
     pattern_changed = pyqtSignal()
@@ -588,8 +653,13 @@ class SlotRow(QFrame):
         super().__init__(parent)
         self.label_text = label_text
         self.drum_type = drum_type
-        self.original_data = None
-        self.current_data = None
+        
+        # Audio Data State
+        self.original_data = None    
+        self.current_data = None     
+        self.raw_sample = None       
+        self.is_sample_mode = False  
+        
         self.pattern = [False] * STEPS
         self.velocities = [0.8] * STEPS
         self.pads = []
@@ -601,11 +671,31 @@ class SlotRow(QFrame):
         self.layout.setContentsMargins(0, 0, 0, 0) 
         self.layout.setSpacing(0)
 
-        lbl = QLabel(label_text.lower())
-        lbl.setFixedWidth(55)
-        lbl.setStyleSheet("font-size: 12px; color: #4a5568; font-weight: bold; margin-left: 2px;")
-        self.layout.addWidget(lbl)
+        # --- Label Area (Drag Drop + Reset) ---
+        lbl_frame = QWidget()
+        lbl_frame.setFixedWidth(55)
+        lf_layout = QHBoxLayout(lbl_frame)
+        lf_layout.setContentsMargins(0,0,0,0)
+        lf_layout.setSpacing(0)
 
+        # 1. The Draggable Label
+        self.lbl = DraggableLabel(label_text.lower())
+        self.lbl.file_dropped.connect(self.load_sample)
+        # Allow label to shrink if text is long, so button fits
+        self.lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        lf_layout.addWidget(self.lbl, 1) # Stretch 1
+        
+        # 2. The Reset Button (Minimal fit)
+        self.btn_reset = ClearButton(self)
+        self.btn_reset.setFixedSize(14, 14) # Scaled down
+        self.btn_reset.setToolTip("Remove sample and revert to synth")
+        self.btn_reset.hide()
+        self.btn_reset.clicked.connect(self.reset_to_synth)
+        lf_layout.addWidget(self.btn_reset, 0) # Stretch 0 (Fixed)
+        
+        self.layout.addWidget(lbl_frame)
+
+        # --- Controls ---
         ctrl_frame = QWidget()
         ctrl_layout = QHBoxLayout(ctrl_frame)
         ctrl_layout.setContentsMargins(0, 0, 4, 0)
@@ -644,7 +734,7 @@ class SlotRow(QFrame):
         self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change)
         self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change)
         
-        # New Synth Sliders
+        # Params (Pitch/Decay/Tone) apply to both Synth and Samples
         self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change)
         self.sl_decay = make_v_slider(50, "Decay", self.on_synth_change)
         self.sl_tone = make_v_slider(30, "Tone", self.on_synth_change)
@@ -658,6 +748,7 @@ class SlotRow(QFrame):
         ctrl_layout.addWidget(crush_container)
         self.layout.addWidget(ctrl_frame)
 
+        # --- Pads ---
         for i in range(STEPS):
             p = StepPad(i, self)
             p.toggled.connect(lambda a, v, idx=i: self.update_step(idx, a, v))
@@ -665,9 +756,7 @@ class SlotRow(QFrame):
             self.pads.append(p)
             self.layout.addWidget(p)
             
-            if (i + 1) % 4 == 0 and (i + 1) < STEPS:
-                sep = VerticalSeparator(self)
-                self.layout.addWidget(sep)
+            # Removed VerticalSeparator logic here
 
         self.btn_clr = ClearButton(self)
         self.btn_clr.clicked.connect(self.clear)
@@ -676,6 +765,56 @@ class SlotRow(QFrame):
         
         self.layout.addStretch() 
         self.update_sound()
+
+    def load_sample(self, file_path):
+        try:
+            # Load file, flatten to mono, resample to SR
+            data, samplerate = sf.read(file_path)
+            if len(data.shape) > 1:
+                data = np.mean(data, axis=1) # Convert stereo to mono
+            
+            if samplerate != SR:
+                num_samples = int(len(data) * SR / samplerate)
+                data = signal.resample(data, num_samples)
+            
+            # Normalize
+            peak = np.max(np.abs(data))
+            if peak > 0: data = data / peak
+            
+            # Trim silence
+            data = SynthEngine.ensure_zero_crossing(data.astype(np.float32))
+
+            self.raw_sample = data
+            self.is_sample_mode = True
+            
+            # Visual indication
+            self.lbl.setStyleSheet("""
+                QLabel { color: #38a169; font-weight: bold; font-size: 12px; margin-left: 2px;} 
+                QLabel:hover { background-color: #f0fff4; }
+            """)
+            self.btn_reset.show()
+            self.saved_msg.emit(f"loaded: {file_path.split('/')[-1]}")
+            
+            self.update_sound(play=True)
+            
+        except Exception as e:
+            self.saved_msg.emit("load err")
+            print(e)
+
+    def reset_to_synth(self):
+        self.is_sample_mode = False
+        self.raw_sample = None
+        self.btn_reset.hide()
+        self.lbl.setStyleSheet("""
+            QLabel { 
+                font-size: 12px; color: #4a5568; font-weight: bold; 
+                margin-left: 2px; border: 1px dashed transparent;
+                border-radius: 4px; padding: 2px;
+            }
+            QLabel:hover { background-color: #ebf8ff; border-color: #90cdf4; color: #2b6cb0; }
+        """)
+        self.saved_msg.emit(f"reverted: {self.label_text}")
+        self.update_sound(play=True)
 
     def start_painting(self, state):
         self.paint_state = state
@@ -706,17 +845,17 @@ class SlotRow(QFrame):
         self.update_synth_params(p, d, t)
 
     def update_sound(self, play=False):
-        self.original_data = SynthEngine.generate_drum(self.drum_type, self.synth_params)
+        if self.is_sample_mode and self.raw_sample is not None:
+            # Apply Pitch, Decay, Tone to the raw sample
+            self.original_data = SynthEngine.process_sample(self.raw_sample, self.synth_params)
+        else:
+            # Generate fresh synth sound
+            self.original_data = SynthEngine.generate_drum(self.drum_type, self.synth_params)
+            
         self.process_audio()
         if play and self.current_data is not None:
             self.preview_req.emit(self.current_data)
         self.pattern_changed.emit()
-
-    def on_synth_change(self):
-        p = self.sl_pitch.value() / 100.0
-        d = self.sl_decay.value() / 100.0
-        t = self.sl_tone.value() / 100.0
-        self.update_synth_params(p, d, t)
 
     def on_crush_change(self):
         self.process_audio()
@@ -758,27 +897,20 @@ class SlotRow(QFrame):
         if changed: self.pattern_changed.emit()
 
     def syncopate_gentle(self):
-        # Define density based on drum type for "musical" randomness
         density = 0.35
         if "kick" in self.label_text: density = 0.25
         elif "hat" in self.label_text: density = 0.5
         elif "snare" in self.label_text: density = 0.2
         
         for i in range(STEPS):
-            # Roll the dice
             is_active = np.random.random() < density
-            
             self.pattern[i] = is_active
             self.pads[i].active = is_active
-            
             if is_active:
-                # Assign random velocity with some dynamics
                 new_vel = np.random.uniform(0.4, 1.0)
                 self.velocities[i] = new_vel
                 self.pads[i].velocity = new_vel
-            
             self.pads[i].update()
-            
         self.pattern_changed.emit()
 
     def clear(self):
@@ -804,49 +936,18 @@ class SlotRow(QFrame):
 
     def drift_params(self, amount):
         if amount <= 0.01: return
-        
         targets = [self.sl_crush, self.sl_filt, self.sl_pitch, self.sl_decay, self.sl_tone]
-        
         for sl in targets:
-            # 1. Initialize physics state
-            if not hasattr(sl, '_f_val'): 
-                sl._f_val = float(sl.value())
-            if not hasattr(sl, '_vel'): 
-                # Give it a tiny initial push so they don't all start static
-                sl._vel = np.random.uniform(-0.05, 0.05)
-
-            # 2. Calculate "Wind" Force
-            # Instead of random position jumps, we apply random FORCE to velocity.
-            # This creates smooth acceleration/deceleration curves (waves).
+            if not hasattr(sl, '_f_val'): sl._f_val = float(sl.value())
+            if not hasattr(sl, '_vel'): sl._vel = np.random.uniform(-0.05, 0.05)
             force = (np.random.random() - 0.5) * 0.04 * amount
-
-            # 3. Soft Boundaries (Rubber band effect)
-            # If we get near the edges (0 or 100), apply a gentle opposing force.
-            # This allows "random extensions" to the edge, but pulls them back eventually.
-            if sl._f_val < 10: 
-                force += 0.03 * amount
-            elif sl._f_val > 90: 
-                force -= 0.03 * amount
-
-            # 4. Apply Physics
-            # Add force to velocity
+            if sl._f_val < 10: force += 0.03 * amount
+            elif sl._f_val > 90: force -= 0.03 * amount
             sl._vel += force
-            
-            # Apply Friction (Damping)
-            # A high value (0.99) creates heavy, water-like movement.
-            # A lower value (0.90) would be faster and more erratic.
             sl._vel *= 0.985
-            
-            # Apply velocity to position
             new_val = sl._f_val + sl._vel
-            
-            # Hard clip at absolute edges so we don't crash
             sl._f_val = np.clip(new_val, 0.0, 100.0)
-
-            # 5. Update UI
-            # Only update the slider if the integer value actually changed
-            if int(sl._f_val) != sl.value():
-                sl.setValue(int(sl._f_val))
+            if int(sl._f_val) != sl.value(): sl.setValue(int(sl._f_val))
 
 class CircleSlider(QSlider):
     def __init__(self, orientation, parent=None):
