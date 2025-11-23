@@ -8,7 +8,8 @@ it has 808-style synthesis with polyrhythmic sequencing, along with physics-base
 - clip  
 - evolve  
 - bit (downsample)  
-- flt (lowpass to highpass)  
+- flt (lowpass/highpass)  
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
