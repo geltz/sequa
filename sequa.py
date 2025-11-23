@@ -19,7 +19,7 @@ from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QMediaDevices
 SR = 44100
 BPM_DEFAULT = 120
 STEPS = 16
-BUFFER_MS = 100
+BUFFER_MS = 60
 
 # --- Audio Streaming ---
 
@@ -239,19 +239,17 @@ class SynthEngine:
             y = processed * env
 
         elif drum_type == "clap":
-            # 909-style Clap: Multiple impulses (flam) followed by decay
-            # Noise source
             noise = rng.uniform(-1, 1, len(t))
-            
-            # Filter: Wide Bandpass 
-            low = 800 + (p_pitch * 400)
-            high = 3000 + (p_pitch * 1000)
+
+            low = 900 + (p_pitch * 200)
+            high = 2400 + (p_pitch * 600)
             filt = signal.sosfilt(signal.butter(2, [low, high], 'bp', fs=SR, output='sos'), noise)
             
-            # Envelope: The "Flam"
+            # Envelope: The "Flam" (Multiple sharp impulses)
             env = np.zeros_like(t)
-            # 3-4 pulses, spaced ~10ms apart
-            pulse_spacing = 0.011 
+            
+            # Tighter spacing (9ms) for a "punchier" feel without adding bass
+            pulse_spacing = 0.009
             
             # Decay affects the tail length
             tail_decay = 30 + ((1.0 - p_decay) * 60)
@@ -260,17 +258,16 @@ class SynthEngine:
                 start_idx = int(i * pulse_spacing * SR)
                 if start_idx >= len(env): break
                 
-                # Amplitude slightly varies (first hits are transients)
+                # Last hit is the loudest (1.0), pre-hits are transients (0.7)
                 amp = 0.7 if i < 3 else 1.0
                 
                 remaining = len(env) - start_idx
                 local_t = np.linspace(0, remaining/SR, remaining)
                 
-                # Sharp decay for pulses, looser for tail
-                decay = 200 if i < 3 else tail_decay
+                # Extremely sharp decay (350) for the flam hits
+                decay = 350 if i < 3 else tail_decay
                 pulse_env = np.exp(-local_t * decay) * amp
                 
-                # Add to main envelope
                 env[start_idx:] = np.maximum(env[start_idx:], pulse_env)
 
             y = filt * env
@@ -348,29 +345,34 @@ class AudioMixer:
         total_samples = int(sec_step * steps * SR)
         swing_offset = int(sec_step * swing * 0.33 * SR)
         
-        # Buffer slightly larger for decay trails
         out = np.zeros(total_samples + int(SR * 0.5), dtype=np.float32)
 
         for s in slots:
             raw_data = s['data']
             if raw_data is None or len(raw_data) == 0: continue
             
-            # Optimization: Don't process massive arrays if they are clipped anyway
-            # Calculate Max Length needed for this BPM (approx 4 seconds usually)
+            # Optimization: Calculate max possible length
             max_seq_len = total_samples + int(SR * 0.5) 
 
             if clip_val > 0.0:
-                keep_ratio = 1.0 - (clip_val ** 0.5)
-                # Ensure we don't slice smaller than 100 samples
-                actual_len = max(100, int(len(raw_data) * keep_ratio))
-                data = raw_data[:actual_len].copy() # Copy is safer here
+                # NEW CURVE: "Analog Gate" Style
+                # 10% slider (0.1) -> keeps only 30% of the sample.
+                # 50% slider (0.5) -> keeps only 9% of the sample.
+                # This makes the effect "pronounced early on".
+                keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
                 
-                fade_samples = min(300, int(actual_len * 0.2))
+                # Ensure we don't make it smaller than 150 samples (to avoid disappearing completely)
+                actual_len = max(150, int(len(raw_data) * keep_ratio))
+                
+                # Copy sliced data
+                data = raw_data[:actual_len].copy()
+                
+                # Fast fade out to prevent clicks on the cut
+                fade_samples = min(400, int(actual_len * 0.3))
                 if fade_samples > 0:
                     data[-fade_samples:] *= np.linspace(1, 0, fade_samples)
             else:
-                # OPTIMIZATION: Even without clip, don't use more data than fits in the loop
-                # This prevents adding a 3-second tail to a 1-second loop unnecessarily
+                # Standard length check
                 if len(raw_data) > max_seq_len:
                      data = raw_data[:max_seq_len]
                 else:
@@ -383,26 +385,19 @@ class AudioMixer:
                     start_pos = int(i * sec_step * SR)
                     if i % 2 != 0: start_pos += swing_offset
                     
-                    # Bounds checking
                     if start_pos < len(out):
                         write_len = min(s_len, len(out) - start_pos)
-                        # Vectorized addition
                         out[start_pos : start_pos + write_len] += data[:write_len] * (vel ** 1.5)
         
-        # Wrap tail (Looping)
         tail = out[total_samples:]
         wrap_len = min(len(tail), total_samples)
         out[:wrap_len] += tail[:wrap_len]
         
         final = out[:total_samples]
-        
-        # Hard Limit (Clipping protection)
         np.clip(final, -1.0, 1.0, out=final)
         
-        # Normalize only if too loud (prevents volume pumping on quiet loops)
         peak = np.max(np.abs(final))
-        if peak > 0.95: 
-            final *= (0.95 / peak)
+        if peak > 0.95: final *= (0.95 / peak)
             
         return final
 
