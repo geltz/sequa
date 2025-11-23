@@ -18,10 +18,9 @@ it also lets you import your own sounds by dragging an audio file on any pad nam
 - swing  
 - clip  
 - evolve
+- rev
 - bit (downsample)  
 - flt (lowpass/highpass)  
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
-
-
