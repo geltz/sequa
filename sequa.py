@@ -12,7 +12,7 @@ from PyQt6.QtGui import (QColor, QPainter, QPen, QFont, QPainterPath,
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
                              QFrame, QMessageBox, QGraphicsOpacityEffect,
-                             QSizePolicy, QTabWidget, QGridLayout)
+                             QSizePolicy, QTabWidget, QGridLayout, QFileDialog)
 from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QMediaDevices
 
 # --- Constants ---
@@ -339,7 +339,7 @@ class SynthEngine:
 
 class AudioMixer:
     @staticmethod
-    def mix_sequence(slots, bpm, swing, clip_val, steps=STEPS):
+    def mix_sequence(slots, bpm, swing, clip_val, rev_prob, steps=STEPS):
         sec_beat = 60.0 / bpm
         sec_step = sec_beat / 4.0
         total_samples = int(sec_step * steps * SR)
@@ -354,25 +354,22 @@ class AudioMixer:
             # Optimization: Calculate max possible length
             max_seq_len = total_samples + int(SR * 0.5) 
 
+            # --- Reverse Logic ---
+            # If the probability check passes, flip the audio array
+            if rev_prob > 0.0 and np.random.random() < rev_prob:
+                # Use ascontiguousarray to ensure memory safety after slicing
+                raw_data = np.ascontiguousarray(raw_data[::-1])
+
             if clip_val > 0.0:
                 # NEW CURVE: "Analog Gate" Style
-                # 10% slider (0.1) -> keeps only 30% of the sample.
-                # 50% slider (0.5) -> keeps only 9% of the sample.
-                # This makes the effect "pronounced early on".
                 keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
-                
-                # Ensure we don't make it smaller than 150 samples (to avoid disappearing completely)
                 actual_len = max(150, int(len(raw_data) * keep_ratio))
-                
-                # Copy sliced data
                 data = raw_data[:actual_len].copy()
                 
-                # Fast fade out to prevent clicks on the cut
                 fade_samples = min(400, int(actual_len * 0.3))
                 if fade_samples > 0:
                     data[-fade_samples:] *= np.linspace(1, 0, fade_samples)
             else:
-                # Standard length check
                 if len(raw_data) > max_seq_len:
                      data = raw_data[:max_seq_len]
                 else:
@@ -639,7 +636,7 @@ class DraggableLabel(QLabel):
         super().__init__(text, parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Drag & Drop audio file here (.wav, .mp3, etc)")
+        self.setToolTip("Drag & Drop or Click to load audio file")
         # Make it look slightly interactive
         self.setStyleSheet("""
             QLabel { 
@@ -662,12 +659,21 @@ class DraggableLabel(QLabel):
             path = urls[0].toLocalFile()
             self.file_dropped.emit(path)
 
+    # --- NEW: Click to Open Dialog ---
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            fname, _ = QFileDialog.getOpenFileName(
+                self, "Open Audio Sample", "", "Audio Files (*.wav *.mp3 *.aif *.flac)"
+            )
+            if fname:
+                self.file_dropped.emit(fname)
+
 class SlotRow(QFrame):
     pattern_changed = pyqtSignal()
     preview_req = pyqtSignal(object)
     saved_msg = pyqtSignal(str) 
 
-    def __init__(self, label_text, drum_type, parent=None):
+    def __init__(self, label_text, drum_type, base_hue=0, parent=None):
         super().__init__(parent)
         self.label_text = label_text
         self.drum_type = drum_type
@@ -696,20 +702,17 @@ class SlotRow(QFrame):
         lf_layout.setContentsMargins(0,0,0,0)
         lf_layout.setSpacing(0)
 
-        # 1. The Draggable Label
         self.lbl = DraggableLabel(label_text.lower())
         self.lbl.file_dropped.connect(self.load_sample)
-        # Allow label to shrink if text is long, so button fits
         self.lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        lf_layout.addWidget(self.lbl, 1) # Stretch 1
+        lf_layout.addWidget(self.lbl, 1) 
         
-        # 2. The Reset Button (Minimal fit)
         self.btn_reset = ClearButton(self)
-        self.btn_reset.setFixedSize(14, 14) # Scaled down
+        self.btn_reset.setFixedSize(14, 14)
         self.btn_reset.setToolTip("Remove sample and revert to synth")
         self.btn_reset.hide()
         self.btn_reset.clicked.connect(self.reset_to_synth)
-        lf_layout.addWidget(self.btn_reset, 0) # Stretch 0 (Fixed)
+        lf_layout.addWidget(self.btn_reset, 0)
         
         self.layout.addWidget(lbl_frame)
 
@@ -719,29 +722,28 @@ class SlotRow(QFrame):
         ctrl_layout.setContentsMargins(0, 0, 4, 0)
         ctrl_layout.setSpacing(2) 
         
-        # Export Button
         self.btn_wav = self.create_btn("wav")
         self.btn_wav.clicked.connect(self.export_one)
         ctrl_layout.addWidget(self.btn_wav)
         
-        # Velocity Randomize
         self.btn_vel = self.create_btn("vel")
         self.btn_vel.clicked.connect(self.randomize_velocity)
         ctrl_layout.addWidget(self.btn_vel)
 
-        # Pattern Randomize
         self.btn_rnd = self.create_btn("rnd")
         self.btn_rnd.clicked.connect(self.syncopate_gentle)
         ctrl_layout.addWidget(self.btn_rnd)
         
-        # FX Container (Bit + Filter + Synth Params)
+        # FX Container
         crush_container = QWidget()
         cc_layout = QHBoxLayout(crush_container)
         cc_layout.setContentsMargins(2,0,2,0)
         cc_layout.setSpacing(2) 
         
-        def make_v_slider(val, tip, handler):
-            sl = CircleSlider(Qt.Orientation.Vertical)
+        def make_v_slider(val, tip, handler, hue_offset):
+            # Pass the calculated hue to the slider
+            # hue_offset creates the gradient effect from left to right sliders
+            sl = CircleSlider(Qt.Orientation.Vertical, base_hue=(base_hue + hue_offset) % 360)
             sl.setRange(0, 100)
             sl.setValue(val)
             sl.setFixedSize(20, 60) 
@@ -749,13 +751,12 @@ class SlotRow(QFrame):
             sl.valueChanged.connect(handler)
             return sl
 
-        self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change)
-        self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change)
-        
-        # Params (Pitch/Decay/Tone) apply to both Synth and Samples
-        self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change)
-        self.sl_decay = make_v_slider(50, "Decay", self.on_synth_change)
-        self.sl_tone = make_v_slider(30, "Tone", self.on_synth_change)
+        # Create sliders with increasing hue offsets (0, 8, 16, 24, 32)
+        self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change, 0)
+        self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change, 8)
+        self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change, 16)
+        self.sl_decay = make_v_slider(50, "Decay", self.on_synth_change, 24)
+        self.sl_tone = make_v_slider(30, "Tone", self.on_synth_change, 32)
 
         cc_layout.addWidget(self.sl_crush)
         cc_layout.addWidget(self.sl_filt)
@@ -773,8 +774,6 @@ class SlotRow(QFrame):
             p.velocity_changed.connect(lambda v, idx=i: self.update_vel(idx, v))
             self.pads.append(p)
             self.layout.addWidget(p)
-            
-            # Removed VerticalSeparator logic here
 
         self.btn_clr = ClearButton(self)
         self.btn_clr.clicked.connect(self.clear)
@@ -978,17 +977,34 @@ class SlotRow(QFrame):
             if int(sl._f_val) != sl.value(): sl.setValue(int(sl._f_val))
 
 class CircleSlider(QSlider):
-    def __init__(self, orientation, parent=None):
+    def __init__(self, orientation, base_hue=210, parent=None):
         super().__init__(orientation, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        self.base_hue = base_hue
+        # Start at base hue
+        self.current_hue = base_hue 
+        self.color_1 = QColor.fromHsl(int(self.base_hue), 150, 160)
+        self.color_2 = QColor.fromHsl(int((self.base_hue + 20) % 360), 180, 130)
+        
+        # Random phase so sliders don't pulse in perfect unison
+        self.phase = np.random.rand() * 10
+
+    def tick_color(self):
+        # Slower, discrete-ish oscillation around the base hue (+/- 15 degrees)
+        self.phase += 0.03
+        hue_offset = np.sin(self.phase) * 15
+        h = (self.base_hue + hue_offset) % 360
+        
+        # Generate palette based on new hue
+        self.color_1 = QColor.fromHsl(int(h), 160, 180)
+        self.color_2 = QColor.fromHsl(int((h + 30) % 360), 180, 140)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Dimensions
-        # Increased margin from 6 to 8 to prevent the handle (radius 6) 
-        # from being clipped at the top/bottom edges
         margin = 8
         handle_r = 6.0
         
@@ -1016,8 +1032,6 @@ class CircleSlider(QSlider):
         else:
             cx = self.width() / 2
             h = self.height() - (margin * 2)
-            # Note: Vertical sliders usually range 0 (bottom) to 100 (top)
-            # Calculate Y from bottom up
             norm = (self.value() - self.minimum()) / (self.maximum() - self.minimum())
             y = (self.height() - margin) - (h * norm)
             
@@ -1025,15 +1039,22 @@ class CircleSlider(QSlider):
             painter.setBrush(QColor("#e2e8f0"))
             painter.drawRoundedRect(QRectF(cx - 2, margin, 4, h), 2, 2)
             
-            # Active Groove
-            painter.setBrush(QColor("#4299e1"))
+            # Animated Gradient Fill
             fill_h = (self.height() - margin) - y
             if fill_h > 0:
-                painter.drawRoundedRect(QRectF(cx - 2, y, 4, fill_h), 2, 2)
-            
+                rect = QRectF(cx - 2, y, 4, fill_h)
+                grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+                grad.setColorAt(0, self.color_1)
+                grad.setColorAt(1, self.color_2)
+                painter.setBrush(grad)
+                painter.drawRoundedRect(rect, 2, 2)
+                
+                painter.setPen(QPen(self.color_1, 1))
+            else:
+                painter.setPen(QPen(QColor("#4299e1"), 1))
+
             # Handle
             painter.setBrush(QColor("white"))
-            painter.setPen(QPen(QColor("#4299e1"), 1))
             painter.drawEllipse(QPointF(cx, y), handle_r, handle_r)
 
 class SequaWindow(QMainWindow):
@@ -1047,8 +1068,12 @@ class SequaWindow(QMainWindow):
         self.swing = 0.0
         self.clip_amount = 0.0
         self.evolve_amount = 0.0
+        self.reverse_prob = 0.0 # NEW: Reverse probability
         self.step = -1
         self.last_processed_step = -1
+        
+        # Color animation ticker
+        self.anim_tick_counter = 0
 
         self.fmt = QAudioFormat()
         self.fmt.setSampleRate(SR)
@@ -1080,34 +1105,34 @@ class SequaWindow(QMainWindow):
         cw.setStyleSheet("QWidget { font-family: 'Segoe UI', sans-serif; background-color: #f7fafc; }")
         
         main = QVBoxLayout(cw)
-        # Tighter margins to reduce empty space
         main.setContentsMargins(15, 2, 15, 15) 
         main.setSpacing(2)
 
         # --- Top Control Header ---
         header = QHBoxLayout()
-        # Reduced spacing from 15 to 5 to force sliders to extend
         header.setSpacing(5)
         header.setContentsMargins(0, 0, 0, 5)
         header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # Logo with Top Padding
+        # Logo
         logo_cont = QWidget()
         logo_layout = QVBoxLayout(logo_cont)
-        logo_layout.setContentsMargins(0, 8, 0, 0) # Top padding added here
+        logo_layout.setContentsMargins(0, 8, 0, 0) 
         self.logo = LogoWidget()
         logo_layout.addWidget(self.logo)
         header.addWidget(logo_cont)
         
         def setup_lbl(text):
             l = QLabel(text)
-            l.setFixedWidth(75) 
+            # UPDATED: Increased width from 75 to 85 to fit "evolve 100%"
+            l.setFixedWidth(85) 
             l.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             l.setStyleSheet("color: #4a5568; font-weight: bold; font-size: 12px; margin-right: 4px;")
             return l
 
         def setup_slider(val, callback):
-            sl = CircleSlider(Qt.Orientation.Horizontal)
+            # Use a neutral base hue (Blue) for the top sliders
+            sl = CircleSlider(Qt.Orientation.Horizontal, base_hue=210)
             sl.setRange(0, 100)
             sl.setValue(val)
             sl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1123,10 +1148,8 @@ class SequaWindow(QMainWindow):
 
         self.lbl_swg = setup_lbl("swing")
         header.addWidget(self.lbl_swg)
-        
-        # Handle swing separately to fix clicks
         sl_swg = setup_slider(0, self.set_swing)
-        sl_swg.sliderReleased.connect(self.update_mix) # Only update audio on release
+        sl_swg.sliderReleased.connect(self.update_mix) 
         header.addWidget(sl_swg)
 
         self.lbl_clip = setup_lbl("clip")
@@ -1136,6 +1159,10 @@ class SequaWindow(QMainWindow):
         self.lbl_evolve = setup_lbl("evolve")
         header.addWidget(self.lbl_evolve)
         header.addWidget(setup_slider(0, self.set_evolve))
+
+        self.lbl_rev = setup_lbl("rev")
+        header.addWidget(self.lbl_rev)
+        header.addWidget(setup_slider(0, self.set_rev))
 
         main.addLayout(header)
 
@@ -1181,8 +1208,12 @@ class SequaWindow(QMainWindow):
         drums = [("kick", "kick"), ("snare", "snare"), ("hat c", "closed hat"), 
                  ("hat o", "open hat"), ("clap", "clap"), ("wood", "perc a"), ("tom", "perc b")]
         
-        for l, t in drums:
-            r = SlotRow(l, t)
+        for i, (l, t) in enumerate(drums):
+            # UPDATED: Calculate Hue based on index (Red 0 -> Purple 280)
+            # 7 instruments -> approx 40 degrees shift per row
+            row_hue = int((i / len(drums)) * 280) 
+            
+            r = SlotRow(l, t, base_hue=row_hue)
             r.pattern_changed.connect(self.update_mix)
             r.preview_req.connect(self.play_preview)
             r.saved_msg.connect(self.show_notification)
@@ -1259,11 +1290,16 @@ class SequaWindow(QMainWindow):
     def set_swing(self, v):
         self.swing = v / 100.0
         self.lbl_swg.setText(f"swing {v}%")
-        # Removed immediate update_mix() to prevent audio clicks while dragging
 
     def set_clip(self, v):
         self.clip_amount = v / 100.0
         self.lbl_clip.setText(f"clip {v}%")
+        self.update_mix()
+    
+    # --- NEW: Set Rev ---
+    def set_rev(self, v):
+        self.reverse_prob = v / 100.0
+        self.lbl_rev.setText(f"rev {v}%")
         self.update_mix()
 
     def set_evolve(self, v):
@@ -1280,7 +1316,9 @@ class SequaWindow(QMainWindow):
         slot_data = []
         for s in self.slots:
             slot_data.append({'data': s.current_data, 'pattern': s.pattern, 'velocities': s.velocities})
-        self.gen.set_data(AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, self.clip_amount))
+        # Pass reverse_prob to mix_sequence
+        self.gen.set_data(AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, 
+                                                  self.clip_amount, self.reverse_prob))
 
     def play_preview(self, data):
         self.preview.play(data)
@@ -1302,13 +1340,24 @@ class SequaWindow(QMainWindow):
             self.update_playhead()
 
     def update_playhead(self):
-        if not self.gen.playing: return
-        
-        # Animate logo while playing
+        # Always animate logo
         self.logo.animate()
+        
+        # --- NEW: Animate Slider Colors (Throttled) ---
+        self.anim_tick_counter += 1
+        if self.anim_tick_counter > 15: # Approx every 75ms
+            self.anim_tick_counter = 0
+            for s in self.slots:
+                # Update colors for vertical sliders
+                s.sl_crush.tick_color()
+                s.sl_filt.tick_color()
+                s.sl_pitch.tick_color()
+                s.sl_decay.tick_color()
+                s.sl_tone.tick_color()
+
+        if not self.gen.playing: return
 
         # --- EVOLVE DRIFT ---
-        # Smoothly drift sliders if evolve is active
         if self.evolve_amount > 0.01:
             for s in self.slots: 
                 s.drift_params(self.evolve_amount)
@@ -1322,7 +1371,6 @@ class SequaWindow(QMainWindow):
             for s in self.slots: s.highlight(self.step)
 
             if self.step != self.last_processed_step:
-                # Keep the existing note randomization logic
                 if self.evolve_amount > 0.05:
                     if np.random.random() < (self.evolve_amount * 0.3): 
                         s_idx = np.random.randint(len(self.slots))
@@ -1356,7 +1404,9 @@ class SequaWindow(QMainWindow):
         slot_data = []
         for s in self.slots:
             slot_data.append({'data': s.current_data, 'pattern': s.pattern, 'velocities': s.velocities})
-        mix = AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, self.clip_amount)
+        # Pass reverse_prob to mix_sequence
+        mix = AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, 
+                                      self.clip_amount, self.reverse_prob)
         final = np.tile(mix, 2)
         timestamp = int(time.time())
         filename = f"sequa_loop_{self.bpm}bpm_{timestamp}.wav"
