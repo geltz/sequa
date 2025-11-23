@@ -5,6 +5,7 @@ it has 808-style synthesis with polyrhythmic sequencing, along with physics-base
 it also lets you import your own sounds by dragging an audio file on any pad title.    
 
 **buttons**
+
 - wav (save sound)    
 - vel (rand velocity)  
 - rnd (rand velocity + position)
@@ -13,13 +14,10 @@ it also lets you import your own sounds by dragging an audio file on any pad tit
 
 **sliders**  
 
-all
 - bpm  
 - swing  
 - clip  
 - evolve
-
-one
 - bit (downsample)  
 - flt (lowpass/highpass)  
 - pch (pitch)  
