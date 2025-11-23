@@ -9,16 +9,17 @@ it has 808-style synthesis with polyrhythmic sequencing, along with physics-base
 
 **sliders**  
 
-horizontal
+all
 - bpm  
 - swing  
 - clip  
 - evolve
 
-vertical
+one
 - bit (downsample)  
 - flt (lowpass/highpass)  
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
 
