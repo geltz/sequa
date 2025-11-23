@@ -16,10 +16,11 @@ it also lets you import your own sounds in-place by clicking/dragging on pad tit
 - swing  
 - clip  
 - evolve
-- rev
+- rev (reverse)
 - bit (downsample)  
 - flt (lowpass/highpass)  
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
 
