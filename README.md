@@ -1,3 +1,7 @@
+<p>
+  <img src="icon.png" alt="sequa icon" width="100">
+</p>
+
 sequa is a generative drum machine and synthesis engine with a qt6 interface.	    
 
 it lets you import your own sounds in-place by clicking/dragging on pad titles.    
@@ -26,6 +30,7 @@ left/right mouse to add/remove pads and adjust velocity.
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
 
 
 
