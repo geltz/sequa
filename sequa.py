@@ -8,7 +8,7 @@ from PyQt6.QtCore import (Qt, pyqtSignal, QTimer, QRectF, QIODevice,
                           QByteArray, QPropertyAnimation, QEasingCurve, 
                           QPointF, QUrl)
 from PyQt6.QtGui import (QColor, QPainter, QPen, QFont, QPainterPath, 
-                         QLinearGradient, QBrush)
+                         QLinearGradient, QBrush, QRadialGradient)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
                              QFrame, QMessageBox, QGraphicsOpacityEffect,
@@ -371,31 +371,31 @@ class AudioMixer:
             raw_data = s['data']
             if raw_data is None or len(raw_data) == 0: continue
             
-            # Optimization: Calculate max possible length
+            # 1. Process Length/Gate first (shared logic)
             max_seq_len = total_samples + int(SR * 0.5) 
-
-            # --- Reverse Logic ---
-            # If the probability check passes, flip the audio array
-            if rev_prob > 0.0 and np.random.random() < rev_prob:
-                # Use ascontiguousarray to ensure memory safety after slicing
-                raw_data = np.ascontiguousarray(raw_data[::-1])
-
+            
             if clip_val > 0.0:
-                # NEW CURVE: "Analog Gate" Style
                 keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
                 actual_len = max(150, int(len(raw_data) * keep_ratio))
-                data = raw_data[:actual_len].copy()
+                data_fwd = raw_data[:actual_len].copy()
                 
                 fade_samples = min(400, int(actual_len * 0.3))
                 if fade_samples > 0:
-                    data[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+                    data_fwd[-fade_samples:] *= np.linspace(1, 0, fade_samples)
             else:
                 if len(raw_data) > max_seq_len:
-                     data = raw_data[:max_seq_len]
+                     data_fwd = raw_data[:max_seq_len]
                 else:
-                     data = raw_data
+                     data_fwd = raw_data
 
-            s_len = len(data)
+            # 2. Prepare Reverse Variant
+            # Only create if needed to save resources, but needed for per-step logic
+            if rev_prob > 0.0:
+                data_rev = np.ascontiguousarray(data_fwd[::-1])
+            else:
+                data_rev = data_fwd
+
+            s_len = len(data_fwd)
             
             for i, (active, vel) in enumerate(zip(s['pattern'], s['velocities'])):
                 if active:
@@ -403,8 +403,14 @@ class AudioMixer:
                     if i % 2 != 0: start_pos += swing_offset
                     
                     if start_pos < len(out):
+                        # Per-trigger Reverse Logic
+                        if rev_prob > 0.0 and np.random.random() < rev_prob:
+                            current_sample = data_rev
+                        else:
+                            current_sample = data_fwd
+
                         write_len = min(s_len, len(out) - start_pos)
-                        out[start_pos : start_pos + write_len] += data[:write_len] * (vel ** 1.5)
+                        out[start_pos : start_pos + write_len] += current_sample[:write_len] * (vel ** 1.5)
         
         tail = out[total_samples:]
         wrap_len = min(len(tail), total_samples)
@@ -423,25 +429,37 @@ class AudioMixer:
 class LogoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(54, 54) # Increased from 42 for better visibility
+        self.setFixedSize(60, 60)
         self.grid_size = 4
-        self.cell_size = 10 # Slightly larger cells
-        # Initialize colors (R, G, B) - Pale Palette
+        self.cell_size = 10
         self.current = np.random.uniform(180, 255, (4, 4, 3))
         self.targets = np.random.uniform(180, 255, (4, 4, 3))
         
-        # Font setup for the text below
-        self.text_font = QFont("Segoe UI", 11, QFont.Weight.Bold)
-        self.text_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.5)
+        # 0.0 to 1.0, decays over time
+        self.flash_val = 0.0 
+
+    def trigger_flash(self):
+        self.flash_val = 1.0
 
     def animate(self):
-        # Smooth interpolation towards target colors
-        self.current += (self.targets - self.current) * 0.08
+        # 1. Handle Flash Decay
+        if self.flash_val > 0.001:
+            self.flash_val *= 0.94 # Smooth decay
+        else:
+            self.flash_val = 0.0
+
+        # 2. Speed Calculation
+        # Normal speed 0.08, speeds up to ~0.3 when flashing
+        speed = 0.08 + (self.flash_val * 0.25)
         
-        # Randomly pick new targets for a few cells
-        if np.random.random() < 0.3:
+        # 3. Interpolate Colors
+        self.current += (self.targets - self.current) * speed
+        
+        # Randomly pick new targets
+        # increased probability when flashing for more "activity"
+        prob = 0.3 + (self.flash_val * 0.4)
+        if np.random.random() < prob:
             r, c = np.random.randint(0, self.grid_size, 2)
-            # Target: Cool Pales (Low Red, Med Green, High Blue)
             self.targets[r,c] = [np.random.randint(120, 190), 
                                  np.random.randint(190, 230), 
                                  np.random.randint(230, 255)]
@@ -451,19 +469,40 @@ class LogoWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # 1. Draw Grid (Centered horizontally, top)
+        # Draw Glow (Behind grid)
+        if self.flash_val > 0.01:
+            cx, cy = self.width() / 2, self.height() / 2
+            # Radius expands with flash intensity
+            r = 25 + (self.flash_val * 10) 
+            
+            # Using QRadialGradient (Now Imported)
+            grad = QRadialGradient(cx, cy, r)
+            # Cyan glow with dynamic alpha
+            c = QColor(100, 200, 255, int(150 * self.flash_val))
+            grad.setColorAt(0, c)
+            grad.setColorAt(1, Qt.GlobalColor.transparent)
+            
+            painter.setBrush(grad)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        # Draw Grid
         grid_w = self.grid_size * self.cell_size
         off_x = (self.width() - grid_w) / 2
-        off_y = 2
+        off_y = (self.height() - grid_w) / 2 
         
         for r in range(self.grid_size):
             for c in range(self.grid_size):
                 rgb = self.current[r,c].astype(int)
                 col = QColor(*rgb)
+                
+                # If flashing, tint the cells white slightly
+                if self.flash_val > 0.1:
+                    col = col.lighter(int(100 + (self.flash_val * 60)))
+
                 x = off_x + c * self.cell_size
                 y = off_y + r * self.cell_size
                 
-                # Subtle gradient per cell
                 grad = QLinearGradient(x, y, x + self.cell_size, y + self.cell_size)
                 grad.setColorAt(0, col)
                 grad.setColorAt(1, col.darker(105))
@@ -543,13 +582,14 @@ class StepPad(QWidget):
     toggled = pyqtSignal(bool, float)
     velocity_changed = pyqtSignal(float)
 
-    def __init__(self, index, parent=None):
+    def __init__(self, index, base_hue, parent=None):
         super().__init__(parent)
         self.index = index
+        self.base_hue = base_hue 
         self.active = False
         self.velocity = 0.8
         self.is_playing_head = False
-        self.flash_val = 0.0 # For hit animation
+        self.flash_val = 0.0
         self.is_downbeat = (index % 4 == 0)
         self.setFixedWidth(28)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
@@ -557,11 +597,14 @@ class StepPad(QWidget):
         self.setMouseTracking(True)
 
     def set_playing(self, playing):
+        # Trigger the flash when the playhead lands on this pad
         if self.is_playing_head != playing:
             self.is_playing_head = playing
-            # Trigger flash animation if turning active
+            
+            # If the pad is active and just got hit by playhead, trigger max flash
             if playing and self.active:
                 self.flash_val = 1.0
+            
             self.update()
 
     def process_mouse_input(self, local_pos, force_state=None):
@@ -609,43 +652,58 @@ class StepPad(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = self.rect().adjusted(1, 1, -1, -1)
         
-        # Draw Base
+        # 1. Base Pad Rendering
         if self.active:
-            c = QColor(63, 108, 155)
-            # Apply flash effect: reduce opacity (alpha) temporarily when hit
-            base_alpha = int(100 + (self.velocity * 155))
-            if self.flash_val > 0.01:
-                # Dip alpha significantly based on flash_val for "ghost" effect
-                mod_alpha = base_alpha * (1.0 - (self.flash_val * 0.6))
-                c.setAlpha(int(mod_alpha))
-            else:
-                c.setAlpha(base_alpha)
-                
+            # Dynamic Hue (Wave Effect)
+            t = time.time() * 2.5
+            hue_offset = np.sin(t + (self.index * 0.2)) * 12
+            current_hue = int((self.base_hue + hue_offset) % 360)
+            
+            # Base color
+            c = QColor.fromHsl(current_hue, 160, 140)
+            base_alpha = int(180 + (self.velocity * 75))
+            c.setAlpha(base_alpha)
+            
             painter.setBrush(c)
             painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(r, 3, 3)
+
+            if self.flash_val > 0.01:
+                cx, cy = r.center().x(), r.center().y()
+                rad = max(r.width(), r.height()) * 0.8
+                
+                grad = QRadialGradient(cx, cy, rad)
+
+                glow_alpha = int(self.flash_val * 160)
+                grad.setColorAt(0, QColor(255, 255, 255, glow_alpha))
+                grad.setColorAt(1, QColor(255, 255, 255, 0))
+                
+                painter.setBrush(grad)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(r, 3, 3)
+
         else:
+            # Inactive Pad
             painter.setBrush(QColor("#e2e8f0") if self.is_downbeat else QColor("#edf2f7"))
             painter.setPen(QPen(QColor("#cbd5e0"), 1))
-            
-        painter.drawRoundedRect(r, 3, 3)
+            painter.drawRoundedRect(r, 3, 3)
 
-        # Playhead Highlight
-        if self.is_playing_head:
-            # If active, we handled the visual in the block above, just add subtle overlay
-            if not self.active:
-                 painter.setBrush(QColor(70, 110, 160, 100))
-                 painter.drawRoundedRect(r, 3, 3)
+        # 3. Playhead (Dark Blue) - Only on Inactive Pads
+        if self.is_playing_head and not self.active:
+             painter.setBrush(QColor(40, 60, 90, 50))
+             painter.setPen(Qt.PenStyle.NoPen)
+             painter.drawRoundedRect(r, 3, 3)
 
-        # Velocity Line
+        # 4. Velocity Line (Active Only)
         if self.active:
             ly = max(r.y()+2, min(r.bottom()-2, int(r.y() + r.height() * (1.0 - self.velocity))))
             painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
             painter.drawLine(r.x()+4, ly, r.right()-4, ly)
 
-        # Animation Loop
+        # 5. Animation Loop
         if self.flash_val > 0.01:
-            self.flash_val *= 0.85 # Decay speed
-            self.update() # Request next frame
+            self.flash_val *= 0.96 
+            self.update()
         else:
             self.flash_val = 0.0
 
@@ -721,19 +779,15 @@ class SlotRow(QFrame):
         lf_layout = QHBoxLayout(lbl_frame)
         lf_layout.setContentsMargins(0,0,0,0)
         lf_layout.setSpacing(0)
-
         self.lbl = DraggableLabel(label_text.lower())
         self.lbl.file_dropped.connect(self.load_sample)
         self.lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lf_layout.addWidget(self.lbl, 1) 
-        
         self.btn_reset = ClearButton(self)
         self.btn_reset.setFixedSize(14, 14)
-        self.btn_reset.setToolTip("Remove sample and revert to synth")
         self.btn_reset.hide()
         self.btn_reset.clicked.connect(self.reset_to_synth)
         lf_layout.addWidget(self.btn_reset, 0)
-        
         self.layout.addWidget(lbl_frame)
 
         # --- Controls ---
@@ -741,20 +795,17 @@ class SlotRow(QFrame):
         ctrl_layout = QHBoxLayout(ctrl_frame)
         ctrl_layout.setContentsMargins(0, 0, 4, 0)
         ctrl_layout.setSpacing(2) 
-        
         self.btn_wav = self.create_btn("wav")
         self.btn_wav.clicked.connect(self.export_one)
         ctrl_layout.addWidget(self.btn_wav)
-        
         self.btn_vel = self.create_btn("vel")
         self.btn_vel.clicked.connect(self.randomize_velocity)
         ctrl_layout.addWidget(self.btn_vel)
-
         self.btn_rnd = self.create_btn("rnd")
         self.btn_rnd.clicked.connect(self.syncopate_gentle)
         ctrl_layout.addWidget(self.btn_rnd)
         
-        # FX Container
+        # FX Container (Sliders)
         crush_container = QWidget()
         cc_layout = QHBoxLayout(crush_container)
         cc_layout.setContentsMargins(2,0,2,0)
@@ -762,7 +813,6 @@ class SlotRow(QFrame):
         
         def make_v_slider(val, tip, handler, hue_offset):
             # Pass the calculated hue to the slider
-            # hue_offset creates the gradient effect from left to right sliders
             sl = CircleSlider(Qt.Orientation.Vertical, base_hue=(base_hue + hue_offset) % 360)
             sl.setRange(0, 100)
             sl.setValue(val)
@@ -771,7 +821,6 @@ class SlotRow(QFrame):
             sl.valueChanged.connect(handler)
             return sl
 
-        # Create sliders with increasing hue offsets (0, 8, 16, 24, 32)
         self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change, 0)
         self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change, 8)
         self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change, 16)
@@ -789,7 +838,7 @@ class SlotRow(QFrame):
 
         # --- Pads ---
         for i in range(STEPS):
-            p = StepPad(i, self)
+            p = StepPad(i, base_hue, self)
             p.toggled.connect(lambda a, v, idx=i: self.update_step(idx, a, v))
             p.velocity_changed.connect(lambda v, idx=i: self.update_vel(idx, v))
             self.pads.append(p)
@@ -1033,20 +1082,25 @@ class CircleSlider(QSlider):
         if self.orientation() == Qt.Orientation.Horizontal:
             cy = self.height() / 2
             w = self.width() - (margin * 2)
-            x = margin + (w * (self.value() - self.minimum()) / (self.maximum() - self.minimum()))
+            norm = (self.value() - self.minimum()) / (self.maximum() - self.minimum())
+            x = margin + (w * norm)
             
             # Groove
             painter.setBrush(QColor("#e2e8f0"))
             painter.drawRoundedRect(QRectF(margin, cy - 2, w, 4), 2, 2)
             
-            # Active Groove
-            painter.setBrush(QColor("#4299e1"))
+            # Active Groove (Gradient)
             if x > margin:
-                painter.drawRoundedRect(QRectF(margin, cy - 2, x - margin, 4), 2, 2)
+                rect = QRectF(margin, cy - 2, x - margin, 4)
+                grad = QLinearGradient(rect.topLeft(), rect.topRight())
+                grad.setColorAt(0, self.color_1)
+                grad.setColorAt(1, self.color_2)
+                painter.setBrush(grad)
+                painter.drawRoundedRect(rect, 2, 2)
             
             # Handle
             painter.setBrush(QColor("white"))
-            painter.setPen(QPen(QColor("#4299e1"), 1))
+            painter.setPen(QPen(self.color_1, 1)) # Use dynamic color for border
             painter.drawEllipse(QPointF(x, cy), handle_r, handle_r)
             
         else:
@@ -1123,14 +1177,13 @@ class SequaWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         cw.setStyleSheet("QWidget { font-family: 'Segoe UI', sans-serif; background-color: #f7fafc; }")
-        
         main = QVBoxLayout(cw)
         main.setContentsMargins(15, 2, 15, 15) 
         main.setSpacing(2)
 
         # --- Top Control Header ---
         header = QHBoxLayout()
-        header.setSpacing(5)
+        header.setSpacing(10)
         header.setContentsMargins(0, 0, 0, 5)
         header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
@@ -1144,45 +1197,53 @@ class SequaWindow(QMainWindow):
         
         def setup_lbl(text):
             l = QLabel(text)
-            # UPDATED: Increased width from 75 to 85 to fit "evolve 100%"
-            l.setFixedWidth(85) 
+            l.setFixedWidth(35) 
             l.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            l.setStyleSheet("color: #4a5568; font-weight: bold; font-size: 12px; margin-right: 4px;")
+            l.setStyleSheet("color: #8592a3; font-weight: bold; font-size: 10px; margin-right: 4px;")
             return l
 
-        def setup_slider(val, callback):
-            # Use a neutral base hue (Blue) for the top sliders
-            sl = CircleSlider(Qt.Orientation.Horizontal, base_hue=210)
+        def setup_slider(val, callback, hue):
+            sl = CircleSlider(Qt.Orientation.Horizontal, base_hue=hue)
             sl.setRange(0, 100)
             sl.setValue(val)
             sl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             sl.valueChanged.connect(callback)
             return sl
 
-        # Controls
-        self.lbl_bpm = setup_lbl(f"{self.bpm} bpm")
-        sl_bpm = setup_slider(self.bpm, self.set_bpm)
-        sl_bpm.setRange(60, 200)
+        # --- Controls ---
+        
+        self.lbl_bpm = QLabel(f"bpm\n{self.bpm}")
+        self.lbl_bpm.setFixedWidth(35)
+        self.lbl_bpm.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_bpm.setStyleSheet("color: #676f7c; font-weight: bold; font-size: 11px; margin-right: 4px;")
+        
+        self.sl_bpm = setup_slider(self.bpm, self.set_bpm, 180)
+        self.sl_bpm.setRange(60, 200)
+        self.sl_bpm.setToolTip(f"{self.bpm} BPM") 
+        
         header.addWidget(self.lbl_bpm)
-        header.addWidget(sl_bpm)
+        header.addWidget(self.sl_bpm)
 
         self.lbl_swg = setup_lbl("swing")
+        self.sl_swg = setup_slider(0, self.set_swing, 210)
+        self.sl_swg.sliderReleased.connect(self.update_mix) 
         header.addWidget(self.lbl_swg)
-        sl_swg = setup_slider(0, self.set_swing)
-        sl_swg.sliderReleased.connect(self.update_mix) 
-        header.addWidget(sl_swg)
+        header.addWidget(self.sl_swg)
 
         self.lbl_clip = setup_lbl("clip")
+        self.sl_clip = setup_slider(0, self.set_clip, 240)
         header.addWidget(self.lbl_clip)
-        header.addWidget(setup_slider(0, self.set_clip))
+        header.addWidget(self.sl_clip)
 
-        self.lbl_evolve = setup_lbl("evolve")
+        self.lbl_evolve = setup_lbl("evo")
+        self.sl_evolve = setup_slider(0, self.set_evolve, 270)
         header.addWidget(self.lbl_evolve)
-        header.addWidget(setup_slider(0, self.set_evolve))
+        header.addWidget(self.sl_evolve)
 
         self.lbl_rev = setup_lbl("rev")
+        self.sl_rev = setup_slider(0, self.set_rev, 300)
         header.addWidget(self.lbl_rev)
-        header.addWidget(setup_slider(0, self.set_rev))
+        header.addWidget(self.sl_rev)
 
         main.addLayout(header)
 
@@ -1229,10 +1290,7 @@ class SequaWindow(QMainWindow):
                  ("hat o", "open hat"), ("clap", "clap"), ("wood", "perc a"), ("tom", "perc b")]
         
         for i, (l, t) in enumerate(drums):
-            # UPDATED: Calculate Hue based on index (Red 0 -> Purple 280)
-            # 7 instruments -> approx 40 degrees shift per row
             row_hue = int((i / len(drums)) * 280) 
-            
             r = SlotRow(l, t, base_hue=row_hue)
             r.pattern_changed.connect(self.update_mix)
             r.preview_req.connect(self.play_preview)
@@ -1291,40 +1349,37 @@ class SequaWindow(QMainWindow):
     
     def set_bpm(self, v):
         if self.bpm == v: return
+        self.sl_bpm.setToolTip(f"{v} BPM")
+        self.lbl_bpm.setText(f"bpm\n{v}")
         
         if self.gen.playing:
             loop_duration_old = (60.0 / self.bpm) * 4.0
             elapsed = time.perf_counter() - self.start_time
             phase = (elapsed % loop_duration_old) / loop_duration_old
-            
             self.bpm = v
-            
             loop_duration_new = (60.0 / self.bpm) * 4.0
             self.start_time = time.perf_counter() - (phase * loop_duration_new)
         else:
             self.bpm = v
-            
-        self.lbl_bpm.setText(f"{v} bpm")
         self.update_mix()
 
     def set_swing(self, v):
         self.swing = v / 100.0
-        self.lbl_swg.setText(f"swing {v}%")
+        self.sl_swg.setToolTip(f"{v}%")
 
     def set_clip(self, v):
         self.clip_amount = v / 100.0
-        self.lbl_clip.setText(f"clip {v}%")
+        self.sl_clip.setToolTip(f"{v}%")
         self.update_mix()
     
-    # --- NEW: Set Rev ---
     def set_rev(self, v):
         self.reverse_prob = v / 100.0
-        self.lbl_rev.setText(f"rev {v}%")
+        self.sl_rev.setToolTip(f"{v}%")
         self.update_mix()
 
     def set_evolve(self, v):
         self.evolve_amount = v / 100.0
-        self.lbl_evolve.setText(f"evolve {v}%")
+        self.sl_evolve.setToolTip(f"{v}%")
 
     def sync_all(self):
         for s in self.slots: s.syncopate_gentle()
@@ -1360,20 +1415,28 @@ class SequaWindow(QMainWindow):
             self.update_playhead()
 
     def update_playhead(self):
-        # Always animate logo
         self.logo.animate()
         
-        # --- NEW: Animate Slider Colors (Throttled) ---
         self.anim_tick_counter += 1
         if self.anim_tick_counter > 15: # Approx every 75ms
             self.anim_tick_counter = 0
+            
+            top_sliders = [self.sl_bpm, self.sl_swg, self.sl_clip, self.sl_evolve, self.sl_rev]
+            for sl in top_sliders:
+                sl.tick_color()
+
+            # Also force update active pads to animate their hue
             for s in self.slots:
-                # Update colors for vertical sliders
                 s.sl_crush.tick_color()
                 s.sl_filt.tick_color()
                 s.sl_pitch.tick_color()
                 s.sl_decay.tick_color()
                 s.sl_tone.tick_color()
+                
+                # Update only active pads to save CPU
+                # (Active pads rely on time.time() in paintEvent, so calling update() is enough)
+                for p in s.pads:
+                    if p.active: p.update()
 
         if not self.gen.playing: return
 
@@ -1421,10 +1484,11 @@ class SequaWindow(QMainWindow):
         self.fade_anim.start()
 
     def export_beat(self):
+        self.logo.trigger_flash()
+        
         slot_data = []
         for s in self.slots:
             slot_data.append({'data': s.current_data, 'pattern': s.pattern, 'velocities': s.velocities})
-        # Pass reverse_prob to mix_sequence
         mix = AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, 
                                       self.clip_amount, self.reverse_prob)
         final = np.tile(mix, 2)
