@@ -4,9 +4,9 @@ it also lets you import your own sounds in-place by clicking/dragging on pad tit
 
 **buttons**
 
-- wav (save sound)    
-- vel (rand velocity)  
-- rnd (rand velocity + position)
+- wav (save)    
+- vel (velocity)  
+- rnd (velocity/position)
 - export loop
 - clear all
 
@@ -15,12 +15,13 @@ it also lets you import your own sounds in-place by clicking/dragging on pad tit
 - bpm  
 - swing  
 - clip  
-- evolve
+- evo (change sliders)  
 - rev (reverse)
 - bit (downsample)  
 - flt (lowpass/highpass)  
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
 
 
