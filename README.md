@@ -1,4 +1,4 @@
-sequa is a generative drum machine and synthesis engine with a pyqt6 interface.	    
+sequa is a generative drum machine and synthesis engine with a qt6 interface.	    
 
 it also lets you import your own sounds in-place by clicking/dragging on pad titles.    
 
@@ -22,4 +22,5 @@ it also lets you import your own sounds in-place by clicking/dragging on pad tit
 - pch (pitch)  
 - dec (decay)  
 - ton (tone)    
+
 
