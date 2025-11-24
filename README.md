@@ -12,9 +12,9 @@ left/right mouse to add/remove pads and adjust velocity.
 
 **buttons**
 
-- wav (save)    
-- vel (velocity)  
-- rnd (velocity/position)
+- wav - save    
+- vel  - velocity  
+- rnd - velocity/position
 - export loop
 - clear all
 
@@ -23,13 +23,14 @@ left/right mouse to add/remove pads and adjust velocity.
 - bpm  
 - swing  
 - clip  
-- evo (evolve)  
-- rev (reverse)
-- bit (downsample)  
-- flt (lowpass/highpass)  
-- pch (pitch)  
-- dec (decay)  
-- ton (tone)    
+- evo - evolve  
+- rev - reverse
+- bit - downsample   
+- flt - lowpass/highpass  
+- pch - pitch  
+- dec - decay  
+- ton - tone    
+
 
 
 
