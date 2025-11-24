@@ -206,36 +206,56 @@ class SynthEngine:
             y = (tone_osc * 0.5) + (noise * noise_env * 0.8)
 
         elif drum_type == "closed hat" or drum_type == "open hat":
-            # 808-style
-            # Uses ratios closer to the original 6 schmitt trigger oscillators
-            base_f = 200 + (p_pitch * 150)
+
+            base_f = 350 + (p_pitch * 200) 
             ratios = [2.0, 3.0, 4.16, 5.43, 6.79, 8.21]
-            sum_sig = np.zeros_like(t)
+            metal_sig = np.zeros_like(t)
             
             for r in ratios:
-                phase = 2 * np.pi * base_f * r * t
-                sum_sig += np.sign(np.sin(phase)) # Square waves
+                phase_offset = np.random.rand() * 2 * np.pi
+                metal_sig += np.sign(np.sin((2 * np.pi * base_f * r * t) + phase_offset))
             
-            # Bandpass: 808 hats are distinctively bandpassed
-            # Modified: Higher center and wider band for "Air"
-            bp_center = 4000 + (p_tone * 5000) 
-            sos_bp = signal.butter(2, [bp_center, bp_center + 4000], 'bp', fs=SR, output='sos')
-            processed = signal.sosfilt(sos_bp, sum_sig)
-            
-            # Highpass: Clean up mud - Raised frequency for softer texture
-            hp_freq = 7000 + (p_tone * 3000)
-            sos_hp = signal.butter(2, hp_freq, 'hp', fs=SR, output='sos')
-            processed = signal.sosfilt(sos_hp, processed)
+            metal_sig /= len(ratios)
 
+            noise_sig = np.random.uniform(-1, 1, len(t))
+            
+            # Pre-filter noise: Keep strictly high frequency
+            sos_noise_hp = signal.butter(2, 7000, 'hp', fs=SR, output='sos')
+            noise_sig = signal.sosfilt(sos_noise_hp, noise_sig)
+
+            mix_ratio = 0.35 - (p_tone * 0.1) 
+            sum_sig = (metal_sig * mix_ratio) + (noise_sig * (1 - mix_ratio))
+
+            # --- Main filtering ---
+
+            # Change order from 2 -> 4. This creates a much steeper "cliff",
+            # chopping out the 2k-4k range completely.
+            hp_freq = 2000 + (p_tone * 3000)
+            sos_hp = signal.butter(4, hp_freq, 'hp', fs=SR, output='sos')
+            processed = signal.sosfilt(sos_hp, sum_sig)
+
+            bp_low = 6000 + (p_tone * 1000)
+            bp_high = bp_low + 8000 
+            sos_bp = signal.butter(2, [bp_low, bp_high], 'bp', fs=SR, output='sos')
+            processed = signal.sosfilt(sos_bp, processed)
+
+            # --- Envelope ---
+            
             if drum_type == "closed hat":
-                decay_coef = 60 + ((1.0 - p_decay) * 200)
+                # Made decay slightly faster to sound "crisper"
+                decay_coef = 90 + ((1.0 - p_decay) * 300)
+                env = np.exp(-t * decay_coef)
             else:
-                decay_coef = 8 + ((1.0 - p_decay) * 90)
-            
-            # Soften attack slightly to remove digital click
-            processed[:50] *= np.linspace(0, 1, 50)
-            
-            env = np.exp(-t * decay_coef)
+                # Open hat
+                env = 0.7 * np.exp(-t * (10 + (1-p_decay)*50)) + \
+                      0.3 * np.exp(-t * (2 + (1-p_decay)*10))
+
+            # Anti-click attack
+            attack_samples = int(SR * 0.0030) 
+            if len(processed) > attack_samples:
+                smooth_attack = 0.5 * (1 - np.cos(np.linspace(0, np.pi, attack_samples)))
+                processed[:attack_samples] *= smooth_attack
+
             y = processed * env
 
         elif drum_type == "clap":
