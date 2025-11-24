@@ -1,4 +1,6 @@
+import ctypes
 import sys
+import os
 import time
 import numpy as np
 import soundfile as sf
@@ -8,7 +10,7 @@ from PyQt6.QtCore import (Qt, pyqtSignal, QTimer, QRectF, QIODevice,
                           QByteArray, QPropertyAnimation, QEasingCurve, 
                           QPointF, QUrl)
 from PyQt6.QtGui import (QColor, QPainter, QPen, QFont, QPainterPath, 
-                         QLinearGradient, QBrush, QRadialGradient)
+                         QLinearGradient, QBrush, QRadialGradient, QIcon, QFontMetrics)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
                              QFrame, QMessageBox, QGraphicsOpacityEffect,
@@ -470,14 +472,12 @@ class LogoWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         # Draw Glow (Behind grid)
+        # Reduced radius slightly to prevent clipping (Max ~28px fits inside 60px widget)
         if self.flash_val > 0.01:
             cx, cy = self.width() / 2, self.height() / 2
-            # Radius expands with flash intensity
-            r = 25 + (self.flash_val * 10) 
+            r = 20 + (self.flash_val * 8) 
             
-            # Using QRadialGradient (Now Imported)
             grad = QRadialGradient(cx, cy, r)
-            # Cyan glow with dynamic alpha
             c = QColor(100, 200, 255, int(150 * self.flash_val))
             grad.setColorAt(0, c)
             grad.setColorAt(1, Qt.GlobalColor.transparent)
@@ -486,27 +486,43 @@ class LogoWidget(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(cx, cy), r, r)
 
-        # Draw Grid
+        # Draw Grid with Soft Edges and Alpha Fade
         grid_w = self.grid_size * self.cell_size
         off_x = (self.width() - grid_w) / 2
         off_y = (self.height() - grid_w) / 2 
         
+        painter.setPen(Qt.PenStyle.NoPen)
+        center_idx = 1.5 # Center of a 4x4 grid is between indices 1 and 2
+
         for r in range(self.grid_size):
             for c in range(self.grid_size):
                 rgb = self.current[r,c].astype(int)
                 col = QColor(*rgb)
                 
-                # If flashing, tint the cells white slightly
                 if self.flash_val > 0.1:
                     col = col.lighter(int(100 + (self.flash_val * 60)))
+
+                # Calculate opacity based on distance from center (Neumorphic fade)
+                dist = np.sqrt((r - center_idx)**2 + (c - center_idx)**2)
+                
+                # Alpha curve: Center cells ~200, Corners ~50
+                alpha = int(np.clip(240 - (dist * 80), 0, 255))
+                col.setAlpha(alpha)
 
                 x = off_x + c * self.cell_size
                 y = off_y + r * self.cell_size
                 
-                grad = QLinearGradient(x, y, x + self.cell_size, y + self.cell_size)
+                rect = QRectF(x + 1, y + 1, self.cell_size - 2, self.cell_size - 2)
+                
+                grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
                 grad.setColorAt(0, col)
-                grad.setColorAt(1, col.darker(105))
-                painter.fillRect(QRectF(x, y, self.cell_size-1, self.cell_size-1), grad)
+                
+                col_dark = col.darker(105)
+                col_dark.setAlpha(alpha) # Ensure gradient end matches alpha
+                grad.setColorAt(1, col_dark)
+                
+                painter.setBrush(grad)
+                painter.drawRoundedRect(rect, 3.0, 3.0)
 
 class PlayButton(QPushButton):
     def __init__(self, parent=None):
@@ -514,20 +530,55 @@ class PlayButton(QPushButton):
         self.setFixedSize(80, 26)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.playing = False
+        
+        # Animation State (2 Gradient Stops)
+        # Initialize with the original blueish tone range
+        self.current = np.array([[63., 108., 155.], [80., 130., 170.]])
+        self.targets = np.array([[63., 108., 155.], [80., 130., 170.]])
 
     def set_playing(self, state):
         self.playing = state
         self.update()
 
+    def animate(self):
+        # 1. Smooth Interpolation
+        self.current += (self.targets - self.current) * 0.05
+        
+        # 2. Pick new targets occasionally
+        if np.random.random() < 0.02:
+            # Constrain to "Pastel Blue/Teal" theme to match UI
+            # R: 50-90, G: 100-150, B: 160-210
+            t1 = [np.random.randint(50, 90), np.random.randint(100, 150), np.random.randint(160, 210)]
+            t2 = [np.random.randint(50, 90), np.random.randint(100, 150), np.random.randint(160, 210)]
+            self.targets = np.array([t1, t2])
+            
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bg = QColor("#3f6c9b")
-        if self.underMouse(): bg = bg.lighter(110)
-        if self.isDown(): bg = bg.darker(110)
-        painter.setBrush(bg)
+        
+        # Gradient Background
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        
+        # Convert floats to integers for QColor
+        c1 = QColor(*self.current[0].astype(int))
+        c2 = QColor(*self.current[1].astype(int))
+        
+        # Interaction Tint
+        if self.underMouse():
+            c1, c2 = c1.lighter(110), c2.lighter(110)
+        if self.isDown():
+            c1, c2 = c1.darker(110), c2.darker(110)
+            
+        grad.setColorAt(0, c1)
+        grad.setColorAt(1, c2)
+        
+        painter.setBrush(grad)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(self.rect(), 13, 13)
+        
+        # Icon
         painter.setBrush(QColor("white"))
         cx, cy = self.width() / 2, self.height() / 2
         if self.playing:
@@ -609,19 +660,23 @@ class StepPad(QWidget):
 
     def process_mouse_input(self, local_pos, force_state=None):
         h = self.height()
+        # Ensure y is within bounds for calculation
         y = max(0.0, min(float(h), local_pos.y()))
         new_vel = max(0.1, min(1.0, 1.0 - (y / h)))
 
         if force_state is not None:
+            # Force specific state (Used for drag/paint)
             if self.active != force_state:
                 self.active = force_state
                 if self.active: self.velocity = new_vel
                 self.toggled.emit(self.active, self.velocity)
             elif self.active:
+                # Update velocity if already active
                 if abs(new_vel - self.velocity) > 0.01:
                     self.velocity = new_vel
                     self.velocity_changed.emit(self.velocity)
         else:
+            # Toggle logic (Standard click)
             self.active = not self.active
             if self.active: self.velocity = new_vel
             self.toggled.emit(self.active, self.velocity)
@@ -629,16 +684,34 @@ class StepPad(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
-            self.process_mouse_input(event.pos())
+            self.drag_start_pos = event.position() if hasattr(event, 'position') else event.localPos()
+            self.was_active_at_press = self.active
+            self.is_drag_active = False
+            
+            # If inactive, activate immediately (Standard step-sequencer behavior)
+            if not self.active:
+                self.process_mouse_input(event.pos(), force_state=True)
+            
+            # Initialize painting for dragging across neighbors
             if self.parent() and hasattr(self.parent(), 'start_painting'):
-                self.parent().start_painting(self.active)
+                # Paint target is opposite of what it was, or True if we just activated
+                target = not self.was_active_at_press if self.was_active_at_press else True
+                self.parent().start_painting(target)
 
     def mouseMoveEvent(self, event):
         if event.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton):
+            # 1. Detect Drag Threshold (for velocity adjustment on single pad)
+            if not self.is_drag_active:
+                cur_pos = event.position() if hasattr(event, 'position') else event.localPos()
+                if (cur_pos - self.drag_start_pos).manhattanLength() > 5:
+                    self.is_drag_active = True
+            
             if self.rect().contains(event.pos()):
-                if hasattr(self.parent(), 'paint_state'):
-                    self.process_mouse_input(event.pos(), force_state=self.parent().paint_state)
+                # If dragging inside this pad, update velocity
+                if self.is_drag_active:
+                    self.process_mouse_input(event.pos(), force_state=True)
             else:
+                # 2. Neighbor Painting (Drag across pads)
                 parent = self.parent()
                 if parent:
                     pos_in_parent = self.mapTo(parent, event.pos())
@@ -646,6 +719,12 @@ class StepPad(QWidget):
                     if isinstance(child, StepPad) and child != self:
                          if hasattr(parent, 'paint_state'):
                             child.process_mouse_input(child.mapFrom(parent, pos_in_parent), force_state=parent.paint_state)
+
+    def mouseReleaseEvent(self, event):
+        # If it was a fast click (no drag detected) and pad was originally active, toggle it OFF
+        if not self.is_drag_active and self.was_active_at_press and self.active:
+             if self.rect().contains(event.pos()):
+                self.process_mouse_input(event.pos(), force_state=False)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1032,7 +1111,8 @@ class SlotRow(QFrame):
 
     def drift_params(self, amount):
         if amount <= 0.01: return
-        targets = [self.sl_crush, self.sl_filt, self.sl_pitch, self.sl_decay, self.sl_tone]
+        # Pitch excluded so the beat stays in tune
+        targets = [self.sl_crush, self.sl_filt, self.sl_decay, self.sl_tone]
         for sl in targets:
             if not hasattr(sl, '_f_val'): sl._f_val = float(sl.value())
             if not hasattr(sl, '_vel'): sl._vel = np.random.uniform(-0.05, 0.05)
@@ -1131,6 +1211,106 @@ class CircleSlider(QSlider):
             painter.setBrush(QColor("white"))
             painter.drawEllipse(QPointF(cx, y), handle_r, handle_r)
 
+class StatusWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        
+        self.text = ""
+        self.cols = 10 
+        self.current = np.random.uniform(100, 200, (self.cols, 3))
+        self.targets = np.random.uniform(100, 200, (self.cols, 3))
+        self.flash_val = 0.0
+        self.font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
+        
+        # New Fade Variables
+        self.opacity = 0.0
+        self.fading_out = False
+
+    def set_text(self, text):
+        self.text = text
+        self.flash_val = 1.0
+        self.opacity = 1.0        # Reset opacity to full
+        self.fading_out = False   # Stop any ongoing fade
+        self.update()
+        QTimer.singleShot(2500, lambda: self.clear_text(text))
+
+    def clear_text(self, match_text):
+        if self.text == match_text:
+            self.fading_out = True # Start fade out instead of clearing immediately
+
+    def animate(self):
+        # 1. Handle Fade Out
+        if self.fading_out:
+            self.opacity -= 0.04 # Fade speed
+            if self.opacity <= 0:
+                self.opacity = 0.0
+                self.text = ""
+                self.fading_out = False
+        
+        # 2. Decay Flash
+        if self.flash_val > 0.001:
+            self.flash_val *= 0.92
+        else:
+            self.flash_val = 0.0
+
+        # 3. Interpolate Colors
+        speed = 0.08 + (self.flash_val * 0.2)
+        self.current += (self.targets - self.current) * speed
+        
+        if np.random.random() < 0.1:
+            idx = np.random.randint(0, self.cols)
+            self.targets[idx] = [np.random.randint(60, 100), 
+                                 np.random.randint(100, 180), 
+                                 np.random.randint(180, 255)]
+        
+        # Keep updating if visible or fading
+        if self.opacity > 0 or self.flash_val > 0:
+            self.update()
+
+    def paintEvent(self, event):
+        if not self.text or self.opacity <= 0: return
+        
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self.opacity) # Apply fade opacity
+        
+        fm = QFontMetrics(self.font)
+        
+        # 1. Elide text if it's wider than the widget
+        # We subtract 10px padding to ensure it doesn't touch the edges
+        elided_text = fm.elidedText(self.text, Qt.TextElideMode.ElideMiddle, self.width() - 10)
+        
+        text_w = fm.horizontalAdvance(elided_text)
+        # Ensure tx is never negative (which causes left-side clipping)
+        tx = max(0, int((self.width() - text_w) / 2))
+        ty = int((self.height() + fm.ascent() - fm.descent()) / 2)
+        
+        path = QPainterPath()
+        path.addText(tx, ty, self.font, elided_text)
+        
+        painter.setClipPath(path)
+        
+        # 2. Use Linear Gradient instead of rects
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        
+        for i in range(self.cols):
+            # Calculate gradient stop position (0.0 to 1.0)
+            pos = i / (self.cols - 1) if self.cols > 1 else 0
+            
+            rgb = self.current[i].astype(int)
+            col = QColor(*rgb)
+            
+            if self.flash_val > 0.01:
+                col = col.lighter(int(100 + (self.flash_val * 150)))
+            
+            grad.setColorAt(pos, col)
+            
+        painter.setBrush(grad)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.fillRect(self.rect(), grad)
+
 class SequaWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1164,11 +1344,7 @@ class SequaWindow(QMainWindow):
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(5) 
         self.timer.timeout.connect(self.update_playhead)
-
-        self.msg_timer = QTimer()
-        self.msg_timer.setSingleShot(True)
-        self.msg_timer.timeout.connect(self.start_fade_out)
-
+        
         self.setup_ui()
         self.update_mix()
         self.sink.start(self.gen)
@@ -1187,11 +1363,12 @@ class SequaWindow(QMainWindow):
         header.setContentsMargins(0, 0, 0, 5)
         header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # Logo
+        # Logo - Added directly to header to prevent margin clipping
+        self.logo = LogoWidget()
+        # header.addWidget(self.logo) # We wrap it slightly to ensure left spacing if needed, but direct is safest:
         logo_cont = QWidget()
         logo_layout = QVBoxLayout(logo_cont)
-        logo_layout.setContentsMargins(0, 8, 0, 0) 
-        self.logo = LogoWidget()
+        logo_layout.setContentsMargins(0, 0, 0, 0) # removed the 8px top margin
         logo_layout.addWidget(self.logo)
         header.addWidget(logo_cont)
         
@@ -1329,21 +1506,17 @@ class SequaWindow(QMainWindow):
             QPushButton:hover { border-color: #c53030; background: #fff5f5; }
         """)
 
-        self.lbl_saved_msg = QLabel("")
-        self.lbl_saved_msg.setStyleSheet("color: #4299e1; font-weight: bold; font-size: 12px; margin-left: 10px;")
-        self.fade_effect = QGraphicsOpacityEffect(self.lbl_saved_msg)
-        self.lbl_saved_msg.setGraphicsEffect(self.fade_effect)
-        
-        self.fade_anim = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_anim.setDuration(2000) 
-        self.fade_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self.fade_anim.finished.connect(lambda: self.lbl_saved_msg.setText(""))
+        # Replaced QLabel with StatusWidget
+        self.status_widget = StatusWidget()
         
         bot.addWidget(self.btn_play)
         bot.addSpacing(5)
         bot.addWidget(btn_exp)
-        bot.addWidget(self.lbl_saved_msg)
-        bot.addStretch()
+        bot.addSpacing(10)
+        
+        # Added stretch factor '1' here so the widget expands to fill space
+        bot.addWidget(self.status_widget, 1)
+        
         bot.addWidget(btn_clr)
         main.addLayout(bot)
     
@@ -1416,27 +1589,28 @@ class SequaWindow(QMainWindow):
 
     def update_playhead(self):
         self.logo.animate()
+        self.status_widget.animate()
+        self.btn_play.animate()
         
         self.anim_tick_counter += 1
-        if self.anim_tick_counter > 15: # Approx every 75ms
+        if self.anim_tick_counter > 15: 
             self.anim_tick_counter = 0
             
             top_sliders = [self.sl_bpm, self.sl_swg, self.sl_clip, self.sl_evolve, self.sl_rev]
             for sl in top_sliders:
                 sl.tick_color()
 
-            # Also force update active pads to animate their hue
             for s in self.slots:
                 s.sl_crush.tick_color()
                 s.sl_filt.tick_color()
                 s.sl_pitch.tick_color()
                 s.sl_decay.tick_color()
                 s.sl_tone.tick_color()
-                
-                # Update only active pads to save CPU
-                # (Active pads rely on time.time() in paintEvent, so calling update() is enough)
-                for p in s.pads:
-                    if p.active: p.update()
+
+        # Update pads visually every frame
+        for s in self.slots:
+            for p in s.pads:
+                if p.active: p.update()
 
         if not self.gen.playing: return
 
@@ -1445,12 +1619,14 @@ class SequaWindow(QMainWindow):
             for s in self.slots: 
                 s.drift_params(self.evolve_amount)
 
+        # --- PLAYHEAD LOGIC (Restored) ---
         loop_duration = (60.0 / self.bpm) * 4.0
         elapsed = time.perf_counter() - self.start_time
         current_step = int((elapsed % loop_duration) / loop_duration * STEPS)
         
         if current_step != self.step:
             self.step = current_step if current_step < STEPS else 0
+            # This triggers the dark playhead on the pads
             for s in self.slots: s.highlight(self.step)
 
             if self.step != self.last_processed_step:
@@ -1472,16 +1648,7 @@ class SequaWindow(QMainWindow):
         for s in self.slots: s.highlight(-1)
 
     def show_notification(self, text):
-        self.fade_anim.stop()           
-        self.msg_timer.stop()           
-        self.lbl_saved_msg.setText(text)
-        self.fade_effect.setOpacity(1.0) 
-        self.msg_timer.start(2000)   
-
-    def start_fade_out(self):
-        self.fade_anim.setStartValue(1.0)
-        self.fade_anim.setEndValue(0.0)
-        self.fade_anim.start()
+        self.status_widget.set_text(text)
 
     def export_beat(self):
         self.logo.trigger_flash()
@@ -1501,9 +1668,29 @@ class SequaWindow(QMainWindow):
              QMessageBox.critical(self, "error", f"could not save: {e}")
 
 if __name__ == '__main__':
+    # 1. Fix Taskbar Icon for Windows
+    try:
+        myappid = 'sequa.audio.tool.v1'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass 
+
     app = QApplication(sys.argv)
+    
+    # 2. Set the Application Icon
+    # Resolves absolute path so the EXE finds the icon reliably
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sequa.ico")
+    
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+    elif os.path.exists("sequa.ico"):
+        app.setWindowIcon(QIcon("sequa.ico"))
+
     if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
         app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
+        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+
     app.setStyleSheet("""
         QSlider::groove:horizontal { 
             border: 1px solid #cbd5e0; 
