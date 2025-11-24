@@ -1100,12 +1100,27 @@ class SlotRow(QFrame):
 
     def export_one(self):
         if self.current_data is None: return
+        
+        # --- Directory Setup ---
+        home_dir = os.path.expanduser("~")
+        save_dir = os.path.join(home_dir, "Music", "sequa")
+        
+        if not os.path.exists(save_dir):
+            try: os.makedirs(save_dir)
+            except:
+                self.saved_msg.emit("err: cannot create folder")
+                return
+
+        # --- Save File ---
         timestamp = int(time.time())
         safe_name = self.label_text.replace(" ", "_")
         filename = f"{safe_name}_{timestamp}.wav"
+        full_path = os.path.join(save_dir, filename)
+        
         try:
-            sf.write(filename, self.current_data, SR)
-            self.saved_msg.emit(f"saved: {filename}")
+            sf.write(full_path, self.current_data, SR)
+            # Shortened message for the status bar
+            self.saved_msg.emit(f"saved: Music/sequa/{filename}")
         except Exception as e:
             self.saved_msg.emit(f"err: {str(e)}")
 
@@ -1653,17 +1668,33 @@ class SequaWindow(QMainWindow):
     def export_beat(self):
         self.logo.trigger_flash()
         
+        # --- Mix Logic ---
         slot_data = []
         for s in self.slots:
             slot_data.append({'data': s.current_data, 'pattern': s.pattern, 'velocities': s.velocities})
         mix = AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, 
                                       self.clip_amount, self.reverse_prob)
+        # Tile for 2 loops so the tail wraps nicely for listeners
         final = np.tile(mix, 2)
+        
+        # --- Directory Setup ---
+        home_dir = os.path.expanduser("~")
+        save_dir = os.path.join(home_dir, "Music", "sequa")
+        
+        if not os.path.exists(save_dir):
+            try: os.makedirs(save_dir)
+            except:
+                self.show_notification("err: cannot create folder")
+                return
+
+        # --- Save File ---
         timestamp = int(time.time())
         filename = f"sequa_loop_{self.bpm}bpm_{timestamp}.wav"
+        full_path = os.path.join(save_dir, filename)
+
         try:
-            sf.write(filename, final, SR)
-            self.show_notification(f"exported: {filename}")
+            sf.write(full_path, final, SR)
+            self.show_notification(f"saved to Music/sequa")
         except Exception as e:
              QMessageBox.critical(self, "error", f"could not save: {e}")
 
