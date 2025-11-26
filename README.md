@@ -25,11 +25,12 @@ left/right mouse to add/remove pads and adjust velocity.
 - clip  
 - evo - evolve  
 - rev - reverse
-- bit - downsample   
-- flt - lowpass/highpass  
+- bit - bitcrush   
+- flt - filter  
 - pch - pitch  
 - dec - decay  
 - ton - tone    
+
 
 
 
