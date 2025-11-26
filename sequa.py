@@ -1229,102 +1229,71 @@ class CircleSlider(QSlider):
 class StatusWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(24)
+        self.setFixedHeight(26)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         
         self.text = ""
-        self.cols = 10 
-        self.current = np.random.uniform(100, 200, (self.cols, 3))
-        self.targets = np.random.uniform(100, 200, (self.cols, 3))
-        self.flash_val = 0.0
+        
+        # Internal timer for independent animation
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self.animate)
+        self.anim_timer.setInterval(30) 
+        
         self.font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
         
-        # New Fade Variables
+        # Fade Variables
         self.opacity = 0.0
-        self.fading_out = False
+        self.target_opacity = 0.0
+        self.display_active = False
 
     def set_text(self, text):
         self.text = text
-        self.flash_val = 1.0
-        self.opacity = 1.0        # Reset opacity to full
-        self.fading_out = False   # Stop any ongoing fade
+        self.target_opacity = 1.0
+        self.display_active = True
+        
+        if not self.anim_timer.isActive():
+            self.anim_timer.start()
+            
+        QTimer.singleShot(3000, lambda: self.trigger_fade_out(text))
         self.update()
-        QTimer.singleShot(2500, lambda: self.clear_text(text))
 
-    def clear_text(self, match_text):
+    def trigger_fade_out(self, match_text):
         if self.text == match_text:
-            self.fading_out = True # Start fade out instead of clearing immediately
+            self.target_opacity = 0.0
 
     def animate(self):
-        # 1. Handle Fade Out
-        if self.fading_out:
-            self.opacity -= 0.04 # Fade speed
-            if self.opacity <= 0:
-                self.opacity = 0.0
-                self.text = ""
-                self.fading_out = False
-        
-        # 2. Decay Flash
-        if self.flash_val > 0.001:
-            self.flash_val *= 0.92
+        # 1. Faster Fade Logic
+        if abs(self.opacity - self.target_opacity) > 0.001:
+            # Increased speed factor from 0.05 to 0.15
+            self.opacity += (self.target_opacity - self.opacity) * 0.15
         else:
-            self.flash_val = 0.0
+            self.opacity = self.target_opacity
 
-        # 3. Interpolate Colors
-        speed = 0.08 + (self.flash_val * 0.2)
-        self.current += (self.targets - self.current) * speed
-        
-        if np.random.random() < 0.1:
-            idx = np.random.randint(0, self.cols)
-            self.targets[idx] = [np.random.randint(60, 100), 
-                                 np.random.randint(100, 180), 
-                                 np.random.randint(180, 255)]
-        
-        # Keep updating if visible or fading
-        if self.opacity > 0 or self.flash_val > 0:
+        # Stop timer if fully invisible
+        if self.opacity < 0.01 and self.target_opacity == 0.0:
+            self.opacity = 0.0
+            self.display_active = False
+            self.anim_timer.stop()
+            self.update()
+            return
+
+        if self.display_active:
             self.update()
 
     def paintEvent(self, event):
-        if not self.text or self.opacity <= 0: return
+        if self.opacity <= 0.01: return
         
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setOpacity(self.opacity) # Apply fade opacity
+        painter.setOpacity(self.opacity) 
         
-        fm = QFontMetrics(self.font)
+        # Draw Text (Aligned Left) - No background
+        painter.setPen(QColor("#5a67d8")) # Soft Indigo
+        painter.setFont(self.font)
         
-        # 1. Elide text if it's wider than the widget
-        # We subtract 10px padding to ensure it doesn't touch the edges
-        elided_text = fm.elidedText(self.text, Qt.TextElideMode.ElideMiddle, self.width() - 10)
-        
-        text_w = fm.horizontalAdvance(elided_text)
-        # Ensure tx is never negative (which causes left-side clipping)
-        tx = max(0, int((self.width() - text_w) / 2))
-        ty = int((self.height() + fm.ascent() - fm.descent()) / 2)
-        
-        path = QPainterPath()
-        path.addText(tx, ty, self.font, elided_text)
-        
-        painter.setClipPath(path)
-        
-        # 2. Use Linear Gradient instead of rects
-        grad = QLinearGradient(0, 0, self.width(), 0)
-        
-        for i in range(self.cols):
-            # Calculate gradient stop position (0.0 to 1.0)
-            pos = i / (self.cols - 1) if self.cols > 1 else 0
-            
-            rgb = self.current[i].astype(int)
-            col = QColor(*rgb)
-            
-            if self.flash_val > 0.01:
-                col = col.lighter(int(100 + (self.flash_val * 150)))
-            
-            grad.setColorAt(pos, col)
-            
-        painter.setBrush(grad)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.fillRect(self.rect(), grad)
+        rect = self.rect()
+        text_rect = rect.adjusted(10, 0, -5, 0) 
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text)
 
 class SequaWindow(QMainWindow):
     def __init__(self):
@@ -1521,15 +1490,16 @@ class SequaWindow(QMainWindow):
             QPushButton:hover { border-color: #c53030; background: #fff5f5; }
         """)
 
-        # Replaced QLabel with StatusWidget
         self.status_widget = StatusWidget()
         
         bot.addWidget(self.btn_play)
         bot.addSpacing(5)
         bot.addWidget(btn_exp)
-        bot.addSpacing(10)
         
-        # Added stretch factor '1' here so the widget expands to fill space
+        # Reduced spacing here so the status text feels connected to the export action
+        bot.addSpacing(8) 
+        
+        # Status widget fills the gap between Export and Clear
         bot.addWidget(self.status_widget, 1)
         
         bot.addWidget(btn_clr)
@@ -1604,7 +1574,6 @@ class SequaWindow(QMainWindow):
 
     def update_playhead(self):
         self.logo.animate()
-        self.status_widget.animate()
         self.btn_play.animate()
         
         self.anim_tick_counter += 1
