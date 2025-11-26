@@ -816,11 +816,10 @@ class DraggableLabel(QLabel):
             path = urls[0].toLocalFile()
             self.file_dropped.emit(path)
 
-    # --- NEW: Click to Open Dialog ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             fname, _ = QFileDialog.getOpenFileName(
-                self, "Open Audio Sample", "", "Audio Files (*.wav *.mp3 *.aif *.flac)"
+                self, "open", "", "Audio Files (*.wav *.mp3 *.aif *.flac)"
             )
             if fname:
                 self.file_dropped.emit(fname)
