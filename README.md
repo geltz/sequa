@@ -9,6 +9,7 @@ it lets you import your own sounds in-place by clicking/dragging on pad titles.
 **controls**
 
 left/right mouse to add/remove pads and adjust velocity.  
+space to play/pause.  
 
 **buttons**
 
@@ -30,6 +31,7 @@ left/right mouse to add/remove pads and adjust velocity.
 - pch - pitch  
 - dec - decay  
 - ton - tone    
+
 
 
 
