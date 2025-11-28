@@ -10,7 +10,8 @@ from PyQt6.QtCore import (Qt, pyqtSignal, QTimer, QRectF, QIODevice,
                           QByteArray, QPropertyAnimation, QEasingCurve, 
                           QPointF, QUrl)
 from PyQt6.QtGui import (QColor, QPainter, QPen, QFont, QPainterPath, 
-                         QLinearGradient, QBrush, QRadialGradient, QIcon, QFontMetrics)
+                         QLinearGradient, QBrush, QRadialGradient, QIcon, 
+                         QFontMetrics, QPolygonF)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
                              QFrame, QMessageBox, QGraphicsOpacityEffect,
@@ -21,7 +22,7 @@ from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QMediaDevices
 SR = 44100
 BPM_DEFAULT = 120
 STEPS = 16
-BUFFER_MS = 60
+BUFFER_MS = 90
 
 # --- Audio Streaming ---
 
@@ -39,38 +40,75 @@ class LoopGenerator(QIODevice):
         if is_playing: self.pos = 0
 
     def set_data(self, float_data):
-        audio = np.clip(float_data, -1.0, 1.0)
+        # Safety
+        clean_data = np.nan_to_num(float_data, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 2. Soft Clip to prevent integer wrap-around distortion
+        audio = np.tanh(clean_data) 
+        
+        # 3. Convert to Int16
         audio = (audio * 32767).astype(np.int16)
         new_bytes = audio.tobytes()
         
+        # 4. Seamless Playhead Transfer
+        # If we update audio while playing, try to keep the rhythm position
         current_len = len(self.data)
         new_len = len(new_bytes)
         
         if current_len > 0 and new_len > 0 and self.pos > 0:
             progress = self.pos / current_len
             self.pos = int(progress * new_len)
+            # FORCE EVEN ALIGNMENT (2 bytes per sample)
             if self.pos % 2 != 0: self.pos -= 1
         
         self.data = new_bytes
+        # Ensure pos is within new bounds
         if self.pos >= len(self.data): self.pos = 0
 
     def readData(self, maxlen):
         if not self.playing or not self.data:
+            # Return silence if stopped (prevents audio device underrun noise)
             return b'\x00' * maxlen
 
+        # Alignment Check: QAudioSink requests chunks. 
+        # We must ensure we don't return an odd number of bytes for 16-bit audio.
+        if maxlen % 2 != 0: maxlen -= 1
+        
         chunk = b''
         data_len = len(self.data)
-        while len(chunk) < maxlen:
-            if self.pos >= data_len: self.pos = 0
-            remaining = data_len - self.pos
-            to_read = min(maxlen - len(chunk), remaining)
-            chunk += self.data[self.pos : self.pos + to_read]
-            self.pos += to_read
+        
+        # Optimized Loop: Avoid heavy string concatenation in tight loops
+        # If the requested length wraps around the buffer, we do it in 2 parts max
+        if self.pos >= data_len: self.pos = 0
+        
+        remaining = data_len - self.pos
+        
+        if maxlen <= remaining:
+            # Case A: Continuous read (most common)
+            chunk = self.data[self.pos : self.pos + maxlen]
+            self.pos += maxlen
+        else:
+            # Case B: Wrap around
+            part_1 = self.data[self.pos :]
+            # Calculate what's left to grab from the start
+            needed = maxlen - len(part_1)
+            
+            # If the requested amount is LARGER than the whole buffer (unlikely but safe to handle)
+            # We just repeat the buffer. For now, just grab the start.
+            part_2 = self.data[:needed]
+            
+            chunk = part_1 + part_2
+            self.pos = needed
+
         return chunk
 
     def writeData(self, data): return 0
-    def bytesAvailable(self): return len(self.data) + super().bytesAvailable() + 4096
+    def bytesAvailable(self): 
+        # Report ample bytes to keep the sink pulling
+        return len(self.data) + 4096
     def isSequential(self): return True
+
+# --- Sound Preview ---
 
 class SoundPreview(QIODevice):
     def __init__(self, parent=None):
@@ -87,14 +125,22 @@ class SoundPreview(QIODevice):
     def play(self, float_data):
         self.sink.stop()
         if float_data is None: return
-        audio = np.clip(float_data, -1.0, 1.0)
+        
+        # Sanitize to prevent crashes/noise
+        audio = np.nan_to_num(float_data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        audio = np.clip(audio, -1.0, 1.0)
         audio = (audio * 32767).astype(np.int16)
+        
         self.data_bytes = QByteArray(audio.tobytes())
         self.pos = 0
         self.sink.start(self)
 
     def readData(self, maxlen):
         if self.pos >= self.data_bytes.size(): return b''
+        
+        # Ensure even byte alignment for 16-bit audio
+        if maxlen % 2 != 0: maxlen -= 1
+        
         chunk = self.data_bytes.mid(self.pos, maxlen)
         self.pos += chunk.size()
         return chunk.data()
@@ -103,79 +149,229 @@ class SoundPreview(QIODevice):
     def bytesAvailable(self): return self.data_bytes.size() - self.pos
     def isSequential(self): return True
 
-# --- Synth Engine ---
+# --- Drum Kits ---
 
-class SynthEngine:
+class SimpleDrums:
     @staticmethod
-    def ensure_zero_crossing(data):
-        if len(data) < 200: return SynthEngine.declick(data)
-        limit = min(len(data) // 4, 2000)
-        
-        zero_crossings_start = np.where(np.diff(np.sign(data[:limit])))[0]
-        start_idx = zero_crossings_start[0] + 1 if len(zero_crossings_start) > 0 else 0
-
-        zero_crossings_end = np.where(np.diff(np.sign(data[-limit:])))[0]
-        end_idx = (len(data) - limit) + zero_crossings_end[-1] if len(zero_crossings_end) > 0 else len(data)
-
-        new_data = data[start_idx:end_idx]
-        if len(new_data) < 10: return SynthEngine.declick(data)
-        
-        fade_len = 10
-        if len(new_data) > fade_len * 2:
-            new_data[:fade_len] *= np.linspace(0, 1, fade_len)
-            new_data[-fade_len:] *= np.linspace(1, 0, fade_len)
-        return new_data
-
-    @staticmethod
-    def declick(data):
-        if len(data) < 100: return data
-        fade_len = min(int(SR * 0.003), len(data) // 2)
-        fade_in = np.sin(np.linspace(0, np.pi/2, fade_len))
-        fade_out = np.cos(np.linspace(0, np.pi/2, fade_len))
-        data[:fade_len] *= fade_in
-        data[-fade_len:] *= fade_out
-        return data
-
-    @staticmethod
-    def process_sample(raw_data, params):
-        """Applies Pitch, Decay, and Tone to an external sample."""
-        if raw_data is None or len(raw_data) == 0:
-            return np.zeros(100, dtype=np.float32)
-
+    def generate(drum_type, params):
         p_pitch = params.get('pitch', 0.5)
         p_decay = params.get('decay', 0.5)
         p_tone = params.get('tone', 0.5)
+        
+        # Slightly longer duration to accommodate soft tails
+        duration = 0.6
+        t = np.linspace(0, duration, int(SR * duration), endpoint=False)
+        y = np.zeros_like(t)
+        
+        if drum_type == "kick":
+            # Round, rubbery kick (Pillowy Sine)
+            f_start = 120 + (p_pitch * 50)
+            f_end = 45
+            # Slower pitch drop for a "boom" rather than a "click"
+            freq_env = (f_start - f_end) * np.exp(-t * 12) + f_end
+            phase = np.cumsum(freq_env) * 2 * np.pi / SR
+            
+            # Use sin directly (less saturation than before)
+            osc = np.sin(phase)
+            
+            # Gentle amp envelope
+            d_amp = 6 + ((1.0 - p_decay) * 40)
+            
+            # Aggressive Lowpass to ensure "Sine" purity (removes digital edge)
+            # Cutoff moved down to 300Hz
+            sos_lp = signal.butter(2, 300, 'lp', fs=SR, output='sos')
+            y = signal.sosfilt(sos_lp, osc) * np.exp(-t * d_amp)
 
-        # 1. Pitch (Resampling)
-        # Range: 0.5x speed (low) to 2.0x speed (high)
-        speed = 0.5 + (p_pitch * 1.5)
-        new_len = int(len(raw_data) / speed)
-        if new_len < 10: new_len = 10
-        y = signal.resample(raw_data, new_len)
+        elif drum_type == "snare":
+            # "Boxy" Analog Snare - Sine heavy
+            f_body = 170 + (p_pitch * 40)
+            # Pure sine body
+            body = np.sin(2 * np.pi * f_body * t) * np.exp(-t * 20)
+            
+            noise = np.random.uniform(-0.5, 0.5, len(t))
+            # Soft Bandpass for the noise (brush-like)
+            f_center = 2500 + (p_tone * 1500)
+            sos_bp = signal.butter(2, [f_center - 1000, f_center + 1000], 'bp', fs=SR, output='sos')
+            noise = signal.sosfilt(sos_bp, noise)
+            
+            d_noise = 15 + ((1.0 - p_decay) * 40)
+            # Mix: Body is dominant for the "soft" feel
+            y = (body * 0.8) + (noise * np.exp(-t * d_noise) * 0.4)
 
-        t = np.linspace(0, len(y) / SR, len(y))
+        elif "hat" in drum_type or "cymbal" in drum_type:
+            # Replaced harsh square waves with "Filtered Noise + High Sine"
+            # This creates a soft "Shaker/CR-78" hat vibe.
+            
+            # 1. The "Hiss" (Bandpassed Noise)
+            noise = np.random.uniform(-1, 1, len(t))
+            bp_center = 7000 + (p_tone * 3000)
+            sos_bp = signal.butter(2, [bp_center - 2000, bp_center + 2000], 'bp', fs=SR, output='sos')
+            hiss = signal.sosfilt(sos_bp, noise)
+            
+            # 2. The "Ring" (High Sine for metallic color)
+            f_metal = 800 + (p_pitch * 300)
+            # FM modulation for texture
+            mod = np.sin(2 * np.pi * (f_metal * 3.5) * t) * 50
+            metal = np.sin(2 * np.pi * (f_metal + mod) * t) * 0.2
+            
+            sig = hiss + metal
+            
+            if "closed" in drum_type:
+                decay = 60 + ((1.0 - p_decay) * 200)
+                # Very fast attack softening
+                attack = np.minimum(t * 2000, 1.0)
+                y = sig * attack * np.exp(-t * decay)
+            else:
+                decay = 10 + ((1.0 - p_decay) * 30)
+                y = sig * np.exp(-t * decay) * 0.8
 
-        # 2. Tone (Simple Tilt Filter)
-        # < 0.5 Lowpass, > 0.5 Highpass
-        if p_tone < 0.45:
-            cutoff = 500 + (p_tone * 8000) # 500Hz to ~4kHz
-            sos = signal.butter(1, cutoff, 'lp', fs=SR, output='sos')
-            y = signal.sosfilt(sos, y)
-        elif p_tone > 0.55:
-            cutoff = 100 + ((p_tone - 0.5) * 4000) 
-            sos = signal.butter(1, cutoff, 'hp', fs=SR, output='sos')
-            y = signal.sosfilt(sos, y)
+        elif drum_type == "clap":
+            # Analog Clap: Soft filtered noise
+            noise = np.random.uniform(-1, 1, len(t))
+            # Lower bandpass for a "warmer" clap
+            bp_low = 700 + (p_pitch * 200)
+            bp_high = bp_low + 600
+            sos = signal.butter(2, [bp_low, bp_high], 'bp', fs=SR, output='sos')
+            filt = signal.sosfilt(sos, noise)
+            
+            # Simple envelope, soft attack
+            env = np.exp(-t * (10 + (1.0 - p_decay) * 30))
+            attack = min(len(t), int(SR * 0.015)) # 15ms attack
+            env[:attack] *= np.linspace(0, 1, attack)
+            y = filt * env
 
-        # 3. Decay (Exponential Envelope)
-        # Map decay slider 0.0-1.0 to a decay coefficient
-        decay_coef = 0.5 + ((1.0 - p_decay) * 15) 
-        env = np.exp(-t * decay_coef)
-        y = y * env
+        elif drum_type == "wood" or "perc" in drum_type and "a" in drum_type:
+            # Woodblock: "Bloop" sound
+            # Added slight pitch chirp for that Rhythm Box character
+            f_base = 700 + (p_pitch * 400)
+            f_env = f_base * (1.0 + 0.1 * np.exp(-t * 50))
+            
+            phase = np.cumsum(f_env) * 2 * np.pi / SR
+            osc = np.sin(phase)
+            
+            # Short, percussive envelope
+            decay = 30 + ((1.0 - p_decay) * 100)
+            y = osc * np.exp(-t * decay)
 
-        return SynthEngine.ensure_zero_crossing(y.astype(np.float32))
+        else:
+            # Tom: Pure Sine Sweep
+            f = 140 + (p_pitch * 100)
+            # Gentle sweep
+            f_env = f * (1.0 - 0.2 * np.exp(-t * 10))
+            phase = np.cumsum(f_env) * 2 * np.pi / SR
+            y = np.sin(phase) * np.exp(-t * (8 + (1.0 - p_decay) * 25))
+            
+        return SynthEngine.finalize(y)
+
+class PCMDrums:
+    @staticmethod
+    def degrade(data, sr_target=22050, bit_depth=8):
+        # 1. Resample (Aliasing)
+        if sr_target < SR:
+            factor = int(SR / sr_target)
+            down = data[::factor]
+            data = np.repeat(down, factor)[:len(data)]
+        
+        # 2. Bit Crush
+        steps = 2 ** bit_depth
+        data = np.round(data * steps) / steps
+        return data
 
     @staticmethod
-    def generate_drum(drum_type, params):
+    def generate(drum_type, params):
+        p_pitch = params.get('pitch', 0.5)
+        p_decay = params.get('decay', 0.5)
+        p_tone = params.get('tone', 0.5)
+        
+        duration = 0.5
+        t = np.linspace(0, duration, int(SR * duration), endpoint=False)
+        y = np.zeros_like(t)
+
+        if drum_type == "kick":
+            # "Thud" Kick: Fixed freq body + Click
+            f_body = 60 + (p_pitch * 20)
+            body = np.sin(2 * np.pi * f_body * t)
+            
+            click = np.random.uniform(-1, 1, len(t))
+            sos_click = signal.butter(2, 800, 'lp', fs=SR, output='sos')
+            click = signal.sosfilt(sos_click, click) * np.exp(-t * 100)
+            
+            env = np.exp(-t * (10 + (1.0 - p_decay) * 30))
+            y = (body * 0.8 + click * 0.4) * env
+            y = PCMDrums.degrade(y, sr_target=16000, bit_depth=10)
+
+        elif drum_type == "snare":
+            # "Fat" Snare: Square wave + Noise
+            f_tone = 160 + (p_pitch * 40)
+            tone = np.sign(np.sin(2 * np.pi * f_tone * t)) # Square
+            sos_tone = signal.butter(1, 400, 'lp', fs=SR, output='sos')
+            tone = signal.sosfilt(sos_tone, tone)
+            
+            noise = np.random.uniform(-1, 1, len(t))
+            sos_mid = signal.butter(2, [600, 2000], 'bp', fs=SR, output='sos')
+            noise = signal.sosfilt(sos_mid, noise)
+            
+            d_val = 15 + ((1.0 - p_decay) * 50)
+            y = (tone * 0.4 + noise * 0.8) * np.exp(-t * d_val)
+            y = PCMDrums.degrade(y, sr_target=24000, bit_depth=8)
+            
+        elif "hat" in drum_type:
+            # Shaker/Hat
+            noise = np.random.uniform(-1, 1, len(t))
+            hp_f = 6000 + (p_pitch * 2000)
+            sos_hp = signal.butter(2, hp_f, 'hp', fs=SR, output='sos')
+            y = signal.sosfilt(sos_hp, noise)
+            
+            d_val = 80 if "closed" in drum_type else 15
+            d_val += (1.0 - p_decay) * 100
+            y *= np.exp(-t * d_val)
+            y = PCMDrums.degrade(y, sr_target=32000, bit_depth=6)
+
+        elif drum_type == "clap":
+            # Digital Clap: Wide, noisy, heavy crush
+            noise = np.random.uniform(-1, 1, len(t))
+            
+            # Wider bandpass (600-3000) for a "trashy" sound
+            bp_low = 600 + (p_pitch * 200)
+            bp_high = 3000
+            sos = signal.butter(2, [bp_low, bp_high], 'bp', fs=SR, output='sos')
+            filt = signal.sosfilt(sos, noise)
+            
+            # "Reverb" tail simulation via decay
+            d_val = 10 + ((1.0 - p_decay) * 30)
+            
+            # Simple flam (just double hit) to distinguish from snare
+            env = np.exp(-t * d_val)
+            delay_samples = int(0.015 * SR)
+            env[delay_samples:] += 0.6 * np.exp(-t[:-delay_samples] * d_val)
+            
+            y = filt * env
+            y = PCMDrums.degrade(y, sr_target=14000, bit_depth=8)
+
+        elif drum_type == "wood" or "perc" in drum_type and "a" in drum_type:
+            # Cowbell/Rim: Pulse wave + Bandpass
+            f = 500 + (p_pitch * 300)
+            y = np.sign(np.sin(2 * np.pi * f * t)) 
+            # Bandpass to simulate hollow wood/metal
+            sos_bp = signal.butter(2, [f, f+1500], 'bp', fs=SR, output='sos')
+            y = signal.sosfilt(sos_bp, y)
+            y *= np.exp(-t * (30 + (1.0-p_decay)*50))
+            y = PCMDrums.degrade(y, sr_target=18000, bit_depth=8)
+
+        else:
+            # Tom: Sampled Tom (Lower pitch, longer decay)
+            f = 100 + (p_pitch * 80)
+            y = np.sin(2 * np.pi * f * t)
+            # Add a little bit of noise for texture
+            y += np.random.uniform(-0.1, 0.1, len(t))
+            y *= np.exp(-t * (8 + (1.0-p_decay)*20))
+            y = PCMDrums.degrade(y, sr_target=12000, bit_depth=9)
+
+        return SynthEngine.finalize(y)
+
+class EightDrums:
+    @staticmethod
+    def generate(drum_type, params):
         p_pitch = params.get('pitch', 0.5)
         p_decay = params.get('decay', 0.5)
         p_tone = params.get('tone', 0.5)
@@ -187,19 +383,33 @@ class SynthEngine:
         rng = np.random.default_rng(int(p_pitch * 1000 + p_tone * 100))
 
         if drum_type == "kick":
-            f_start = 50 + (p_pitch * 250)
-            f_end = 30 + (p_pitch * 30)
-            f_decay = 20 + (p_decay * 60)
-            freq_env = (f_start - f_end) * np.exp(-t * f_decay) + f_end
+            # Deep Sine Kick
+            # 1. Pitch Sweep: Start HIGHER (200Hz) for more "Punch/Click"
+            f_start = 200 + (p_pitch * 50) 
+            f_end = 40
+            
+            # Envelope: Faster transient drop (0.008) for tighter impact
+            decay_transient = 0.008
+            
+            freq_env = (f_start - f_end) * np.exp(-t / decay_transient) + f_end
             phase = np.cumsum(freq_env) * 2 * np.pi / SR
-            drive = 1.0 + (p_tone * 3.0)
-            osc = np.tanh(np.sin(phase) * drive)
-            amp_decay = 5 + ((1.0 - p_decay) * 55)
-            amp_env = np.exp(-t * amp_decay)
-            y = osc * amp_env
+            
+            # 2. Waveform: Pure Sine
+            y = np.sin(phase)
+            
+            # 3. Transient: Thud
+            thud_noise = np.random.uniform(-1, 1, len(t))
+            sos_thud = signal.butter(2, 800, 'lp', fs=SR, output='sos')
+            thud = signal.sosfilt(sos_thud, thud_noise) * np.exp(-t * 200)
+            
+            # Amplitude Envelope
+            # CHANGED: Base decay increased from 2 to 6 for a much tighter, shorter tail
+            # Range is now much wider, allowing short kicks by default
+            amp_decay = 6 + ((1.0 - p_decay) * 15)
+            y = (y + thud * 0.5) * np.exp(-t * amp_decay)
 
         elif drum_type == "snare":
-            f_body = 140 + (p_pitch * 150)
+            f_body = 140 + (p_pitch * 120)
             tone_osc = np.sin(2 * np.pi * f_body * t) * np.exp(-t * (30 + (1.0-p_decay)*60))
             filt_center = 1000 + (p_tone * 5000)
             noise = rng.uniform(-1, 1, len(t))
@@ -245,7 +455,7 @@ class SynthEngine:
             
             if drum_type == "closed hat":
                 # Made decay slightly faster to sound "crisper"
-                decay_coef = 90 + ((1.0 - p_decay) * 300)
+                decay_coef = 90 + ((0.75 - p_decay) * 300)
                 env = np.exp(-t * decay_coef)
             else:
                 # Open hat
@@ -264,14 +474,14 @@ class SynthEngine:
             noise = rng.uniform(-1, 1, len(t))
 
             low = 900 + (p_pitch * 200)
-            high = 2400 + (p_pitch * 600)
+            high = 2500 + (p_pitch * 600)
             filt = signal.sosfilt(signal.butter(2, [low, high], 'bp', fs=SR, output='sos'), noise)
             
             # Envelope: The "Flam" (Multiple sharp impulses)
             env = np.zeros_like(t)
             
             # Tighter spacing (9ms) for a "punchier" feel without adding bass
-            pulse_spacing = 0.009
+            pulse_spacing = 0.011
             
             # Decay affects the tail length
             tail_decay = 30 + ((1.0 - p_decay) * 60)
@@ -287,7 +497,7 @@ class SynthEngine:
                 local_t = np.linspace(0, remaining/SR, remaining)
                 
                 # Extremely sharp decay (350) for the flam hits
-                decay = 350 if i < 3 else tail_decay
+                decay = 300 if i < 3 else tail_decay
                 pulse_env = np.exp(-local_t * decay) * amp
                 
                 env[start_idx:] = np.maximum(env[start_idx:], pulse_env)
@@ -323,7 +533,249 @@ class SynthEngine:
         if "hat" in drum_type:
             y *= 0.85
 
-        return SynthEngine.ensure_zero_crossing(y.astype(np.float32))
+        return SynthEngine.finalize(y)
+
+class NineDrums:
+    @staticmethod
+    def generate(drum_type, params):
+        p_pitch = params.get('pitch', 0.5)
+        p_decay = params.get('decay', 0.5)
+        p_tone = params.get('tone', 0.5)
+        
+        duration = 0.8
+        t = np.linspace(0, duration, int(SR * duration), endpoint=False)
+        y = np.zeros_like(t)
+
+        if drum_type == "kick":
+            f_start = 150 + (p_pitch * 250)
+            f_end = 45 + (p_pitch * 30)
+            # Increased decay speed slightly for tighter punch
+            f_decay = 30 + (p_decay * 50) 
+            freq_env = (f_start - f_end) * np.exp(-t * f_decay) + f_end
+            phase = np.cumsum(freq_env) * 2 * np.pi / SR
+            
+            drive = 1.0 + (p_tone * 4.0)
+            osc = np.tanh(np.sin(phase) * drive)
+            
+            amp_decay = 5 + ((1.0 - p_decay) * 45)
+            # Louder click, sharper envelope for punch
+            click = np.random.normal(0, 0.5, len(t)) * np.exp(-t * 300)
+            y = (osc + click * 0.4) * np.exp(-t * amp_decay)
+
+        elif drum_type == "snare":
+            f_root = 170 + (p_pitch * 40)
+            f_env = f_root * (1.0 - 0.05 * t)
+            tone = np.sin(np.cumsum(f_env) * 2 * np.pi / SR)
+            tone_env = np.exp(-t * 25)
+            
+            noise = np.random.uniform(-1, 1, len(t))
+            hp_freq = 1500 + (p_tone * 1000)
+            sos_hp = signal.butter(4, hp_freq, 'hp', fs=SR, output='sos')
+            noise = signal.sosfilt(sos_hp, noise)
+            
+            noise_decay = 20 + ((1.0 - p_decay) * 40)
+            noise_env = np.exp(-t * noise_decay)
+            
+            y = (tone * tone_env * 0.3) + (noise * noise_env * 0.9)
+            y = np.tanh(y * 1.6)
+
+        elif "hat" in drum_type or "cymbal" in drum_type:
+            sig = np.zeros_like(t)
+            freqs = [263, 400, 421, 474, 587, 845]
+            for f in freqs:
+                f_tune = f * (1.0 + p_pitch * 0.2)
+                sig += np.sign(np.sin(2 * np.pi * f_tune * t))
+            
+            if "closed" in drum_type:
+                hp_freq = 7000 + (p_tone * 2000)
+                sos_hp = signal.butter(4, hp_freq, 'hp', fs=SR, output='sos')
+                sig = signal.sosfilt(sos_hp, sig)
+                
+                attack = np.minimum(t * 1500, 1.0) 
+                # Reduced decay rate significantly so it's not just a click
+                # (Lower number in exp = longer sound)
+                decay_rate = 50 + ((1.0 - p_decay) * 150)
+                y = sig * attack * np.exp(-t * decay_rate) * 0.6
+            else:
+                hp_freq = 6000 + (p_tone * 2000)
+                sos_hp = signal.butter(4, hp_freq, 'hp', fs=SR, output='sos')
+                sig = signal.sosfilt(sos_hp, sig)
+                
+                decay = 10 + ((1.0 - p_decay) * 35)
+                y = sig * np.exp(-t * decay)
+                y = np.tanh(y * 1.0) * 0.7
+            
+            # Subtle Lowpass to soften digital harshness
+            sos_lp = signal.butter(2, 13000, 'lp', fs=SR, output='sos')
+            y = signal.sosfilt(sos_lp, y)
+
+        elif drum_type == "clap":
+            noise = np.random.uniform(-1, 1, len(t))
+            low = 1000 + (p_pitch * 200)
+            high = 2400 + (p_pitch * 300)
+            filt = signal.sosfilt(signal.butter(2, [low, high], 'bp', fs=SR, output='sos'), noise)
+            
+            env = np.zeros_like(t)
+            pulse_spacing = 0.009
+            for i in range(4):
+                start_idx = int(i * pulse_spacing * SR)
+                if start_idx >= len(env): break
+                amp = 0.8 if i < 3 else 1.0
+                remaining = len(env) - start_idx
+                local_t = np.linspace(0, remaining/SR, remaining)
+                d_val = 300 if i < 3 else (20 + (1.0 - p_decay) * 50)
+                pulse_env = np.exp(-local_t * d_val) * amp
+                env[start_idx:] = np.maximum(env[start_idx:], pulse_env)
+            y = filt * env
+
+        elif drum_type == "wood" or "perc" in drum_type and "a" in drum_type:
+            f1 = 100 + (p_pitch * 60)
+            f2 = 300 + (p_pitch * 50)
+            
+            osc1 = np.sin(2 * np.pi * f1 * t)
+            osc2 = np.sin(2 * np.pi * f2 * t)
+            
+            noise = np.random.uniform(-1, 1, len(t))
+            # Shorter, sharper transient for "snap"
+            transient = noise * np.exp(-t * 600) * 0.3
+
+            raw = (osc1 * osc2) + transient
+
+            low_cut = 300
+            high_cut = 2500
+            sos_bp = signal.butter(2, [low_cut, high_cut], 'bp', fs=SR, output='sos')
+            y = signal.sosfilt(sos_bp, raw)
+            
+            decay = 60 + ((1.0-p_decay) * 200)
+            y *= np.exp(-t * decay)
+            y = np.tanh(y * 3.0) * 0.8
+
+        else:
+            f_base = 90 + (p_pitch * 60)
+            sweep = np.exp(-t * 15)
+            f_inst = f_base * (1.0 + 0.5 * sweep)
+            phase = np.cumsum(f_inst) * 2 * np.pi / SR
+            y = np.tanh(np.sin(phase) * 1.1)
+            
+            click = np.random.uniform(-1, 1, len(t)) * np.exp(-t * 400)
+            decay = 8 + ((1.0 - p_decay) * 15)
+            y = (y + click * 0.2) * np.exp(-t * decay)
+
+        return SynthEngine.finalize(y)
+
+# --- Synth Engine ---
+
+class SynthEngine:
+    KIT_SIMPLE = 0
+    KIT_PCM = 1
+    KIT_EIGHT = 2
+    KIT_NINE = 3
+    
+    current_kit = KIT_EIGHT
+
+    @staticmethod
+    def set_kit(index):
+        SynthEngine.current_kit = index % 4
+
+    @staticmethod
+    def finalize(data):
+        """Standard cleanup for all engines"""
+        if len(data) < 200: return data
+        
+        # Declick / Fade out
+        fade_len = 50
+        data[-fade_len:] *= np.linspace(1, 0, fade_len)
+        
+        # High Freq Smooth (Studio Polish)
+        sos = signal.butter(1, 18000, 'lp', fs=SR, output='sos')
+        data = signal.sosfilt(sos, data)
+
+        peak = np.max(np.abs(data))
+        if peak > 0: data /= peak
+        return SynthEngine.ensure_zero_crossing(data.astype(np.float32))
+
+    @staticmethod
+    def ensure_zero_crossing(data):
+        # Keep existing implementation
+        if len(data) < 200: return data
+        limit = min(len(data) // 4, 2000)
+        start_idx = 0
+        zc_start = np.where(np.diff(np.sign(data[:limit])))[0]
+        if len(zc_start) > 0: start_idx = zc_start[0] + 1
+        return data[start_idx:]
+
+    @staticmethod
+    def process_sample(raw_data, params):
+        # (Paste your existing process_sample logic here)
+        # It remains the same as before.
+        if raw_data is None or len(raw_data) == 0:
+            return np.zeros(100, dtype=np.float32)
+
+        p_pitch = params.get('pitch', 0.5)
+        p_decay = params.get('decay', 0.5)
+        p_tone = params.get('tone', 0.5)
+
+        speed = 0.5 + (p_pitch * 1.5)
+        new_len = int(len(raw_data) / speed)
+        if new_len < 10: new_len = 10
+        y = signal.resample(raw_data, new_len)
+        t = np.linspace(0, len(y) / SR, len(y))
+
+        if p_tone < 0.45:
+            cutoff = 500 + (p_tone * 8000)
+            sos = signal.butter(1, cutoff, 'lp', fs=SR, output='sos')
+            y = signal.sosfilt(sos, y)
+        elif p_tone > 0.55:
+            cutoff = 100 + ((p_tone - 0.5) * 4000)
+            sos = signal.butter(1, cutoff, 'hp', fs=SR, output='sos')
+            y = signal.sosfilt(sos, y)
+
+        decay_coef = 0.5 + ((1.0 - p_decay) * 15)
+        env = np.exp(-t * decay_coef)
+        y = y * env
+        return SynthEngine.finalize(y)
+    
+    @staticmethod
+    def resample_lofi(data, crush_val):
+        if crush_val <= 0.01: return data
+
+        reduction = 1.0 + (crush_val * 2.5)
+        
+        orig_len = len(data)
+        target_len = max(1, int(orig_len / reduction))
+        lo = signal.resample(data, target_len)
+
+        bits = 16 - (crush_val * 5) 
+        
+        steps = 2 ** bits
+        lo = np.round(lo * steps) / steps
+        restored = signal.resample(lo, orig_len).astype(np.float32)
+        return SynthEngine.ensure_zero_crossing(np.clip(restored, -1.0, 1.0))
+
+    @staticmethod
+    def apply_filter(data, val):
+        # (Paste existing apply_filter)
+        if 0.45 < val < 0.55: return data
+        if val <= 0.45:
+            norm = val / 0.45
+            cutoff = 150 + (norm**2 * 18000)
+            sos = signal.butter(2, cutoff, 'lp', fs=SR, output='sos')
+        else:
+            norm = (val - 0.55) / 0.45
+            cutoff = 20 + (norm**2 * 8000)
+            sos = signal.butter(2, cutoff, 'hp', fs=SR, output='sos')
+        return signal.sosfilt(sos, data).astype(np.float32)
+
+    @staticmethod
+    def generate_drum(drum_type, params):
+        if SynthEngine.current_kit == SynthEngine.KIT_SIMPLE:
+            return SimpleDrums.generate(drum_type, params)
+        elif SynthEngine.current_kit == SynthEngine.KIT_PCM:
+            return PCMDrums.generate(drum_type, params)
+        elif SynthEngine.current_kit == SynthEngine.KIT_NINE:
+            return NineDrums.generate(drum_type, params)
+        else:
+            return EightDrums.generate(drum_type, params)
 
     @staticmethod
     def resample_lofi(data, crush_val):
@@ -373,47 +825,90 @@ class AudioMixer:
             raw_data = s['data']
             if raw_data is None or len(raw_data) == 0: continue
             
-            # 1. Process Length/Gate first (shared logic)
-            max_seq_len = total_samples + int(SR * 0.5) 
+            is_sliced = s.get('is_sliced', False)
             
-            if clip_val > 0.0:
-                keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
-                actual_len = max(150, int(len(raw_data) * keep_ratio))
-                data_fwd = raw_data[:actual_len].copy()
+            # --- Standard One-Shot Logic ---
+            if not is_sliced:
+                # 1. Process Length/Gate (shared logic)
+                max_seq_len = total_samples + int(SR * 0.5) 
                 
-                fade_samples = min(400, int(actual_len * 0.3))
-                if fade_samples > 0:
-                    data_fwd[-fade_samples:] *= np.linspace(1, 0, fade_samples)
-            else:
-                if len(raw_data) > max_seq_len:
-                     data_fwd = raw_data[:max_seq_len]
-                else:
-                     data_fwd = raw_data
-
-            # 2. Prepare Reverse Variant
-            # Only create if needed to save resources, but needed for per-step logic
-            if rev_prob > 0.0:
-                data_rev = np.ascontiguousarray(data_fwd[::-1])
-            else:
-                data_rev = data_fwd
-
-            s_len = len(data_fwd)
-            
-            for i, (active, vel) in enumerate(zip(s['pattern'], s['velocities'])):
-                if active:
-                    start_pos = int(i * sec_step * SR)
-                    if i % 2 != 0: start_pos += swing_offset
+                if clip_val > 0.0:
+                    keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
+                    actual_len = max(150, int(len(raw_data) * keep_ratio))
+                    data_fwd = raw_data[:actual_len].copy()
                     
-                    if start_pos < len(out):
-                        # Per-trigger Reverse Logic
-                        if rev_prob > 0.0 and np.random.random() < rev_prob:
-                            current_sample = data_rev
-                        else:
-                            current_sample = data_fwd
+                    fade_samples = min(400, int(actual_len * 0.3))
+                    if fade_samples > 0:
+                        data_fwd[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+                else:
+                    if len(raw_data) > max_seq_len:
+                         data_fwd = raw_data[:max_seq_len]
+                    else:
+                         data_fwd = raw_data
 
-                        write_len = min(s_len, len(out) - start_pos)
-                        out[start_pos : start_pos + write_len] += current_sample[:write_len] * (vel ** 1.5)
-        
+                # 2. Prepare Reverse Variant
+                if rev_prob > 0.0:
+                    data_rev = np.ascontiguousarray(data_fwd[::-1])
+                else:
+                    data_rev = data_fwd
+
+                s_len = len(data_fwd)
+                
+                for i, (active, vel) in enumerate(zip(s['pattern'], s['velocities'])):
+                    if active:
+                        start_pos = int(i * sec_step * SR)
+                        if i % 2 != 0: start_pos += swing_offset
+                        
+                        if start_pos < len(out):
+                            # Per-trigger Reverse Logic
+                            if rev_prob > 0.0 and np.random.random() < rev_prob:
+                                current_sample = data_rev
+                            else:
+                                current_sample = data_fwd
+
+                            write_len = min(s_len, len(out) - start_pos)
+                            out[start_pos : start_pos + write_len] += current_sample[:write_len] * (vel ** 1.5)
+
+            # --- Sliced Loop Logic (Reseq) ---
+            else:
+                # Raw data is expected to be the full loop stretched to fit
+                step_len_samples = int(sec_step * SR)
+                total_data_len = len(raw_data)
+                
+                # Pre-calculate slice points to match the audio file length
+                slice_len = total_data_len / steps 
+
+                for i, (active, vel) in enumerate(zip(s['pattern'], s['velocities'])):
+                    if active:
+                        # Destination Timing (Includes Swing)
+                        dest_pos = int(i * sec_step * SR)
+                        if i % 2 != 0: dest_pos += swing_offset
+                        
+                        # Source Slicing (Linear Grid)
+                        src_start = int(i * slice_len)
+                        src_end = int((i + 1) * slice_len)
+                        
+                        # Extract Slice
+                        if src_start < total_data_len:
+                            chunk = raw_data[src_start:src_end]
+                            
+                            # Apply Clip/Gate to the slice
+                            if clip_val > 0.0:
+                                keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
+                                keep_len = int(len(chunk) * keep_ratio)
+                                if keep_len < len(chunk):
+                                    chunk = chunk[:keep_len]
+                                    # Declick
+                                    chunk[-100:] *= np.linspace(1, 0, 100)
+
+                            # Apply Reverse
+                            if rev_prob > 0.0 and np.random.random() < rev_prob:
+                                chunk = chunk[::-1]
+                            
+                            write_len = min(len(chunk), len(out) - dest_pos)
+                            if write_len > 0:
+                                out[dest_pos : dest_pos + write_len] += chunk[:write_len] * (vel ** 1.5)
+
         tail = out[total_samples:]
         wrap_len = min(len(tail), total_samples)
         out[:wrap_len] += tail[:wrap_len]
@@ -429,36 +924,42 @@ class AudioMixer:
 # --- UI Components ---
 
 class LogoWidget(QWidget):
+    kit_changed = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(60, 60)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.grid_size = 4
         self.cell_size = 10
         self.current = np.random.uniform(180, 255, (4, 4, 3))
         self.targets = np.random.uniform(180, 255, (4, 4, 3))
-        
-        # 0.0 to 1.0, decays over time
         self.flash_val = 0.0 
+        
+        self.kit_index = 2 # Starts at eight (Indices: 0=simple, 1=pcm, 2=eight, 3=nine)
+        self.kit_names = ["simple", "pcm", "eight", "nine"]
+        self.text_alpha = 0.0
 
     def trigger_flash(self):
         self.flash_val = 1.0
 
-    def animate(self):
-        # 1. Handle Flash Decay
-        if self.flash_val > 0.001:
-            self.flash_val *= 0.94 # Smooth decay
-        else:
-            self.flash_val = 0.0
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Cycle 6 -> 7 -> 8 -> 9
+            self.kit_index = (self.kit_index + 1) % 4
+            self.trigger_flash()
+            self.text_alpha = 1.0
+            self.kit_changed.emit(self.kit_index)
 
-        # 2. Speed Calculation
-        # Normal speed 0.08, speeds up to ~0.3 when flashing
-        speed = 0.08 + (self.flash_val * 0.25)
+    def animate(self):
+        if self.flash_val > 0.001: self.flash_val *= 0.94
+        else: self.flash_val = 0.0
         
-        # 3. Interpolate Colors
+        if self.text_alpha > 0.01: self.text_alpha *= 0.95
+        
+        speed = 0.08 + (self.flash_val * 0.25)
         self.current += (self.targets - self.current) * speed
         
-        # Randomly pick new targets
-        # increased probability when flashing for more "activity"
         prob = 0.3 + (self.flash_val * 0.4)
         if np.random.random() < prob:
             r, c = np.random.randint(0, self.grid_size, 2)
@@ -471,58 +972,46 @@ class LogoWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Draw Glow (Behind grid)
-        # Reduced radius slightly to prevent clipping (Max ~28px fits inside 60px widget)
-        if self.flash_val > 0.01:
-            cx, cy = self.width() / 2, self.height() / 2
-            r = 20 + (self.flash_val * 8) 
-            
-            grad = QRadialGradient(cx, cy, r)
-            c = QColor(100, 200, 255, int(150 * self.flash_val))
-            grad.setColorAt(0, c)
-            grad.setColorAt(1, Qt.GlobalColor.transparent)
-            
-            painter.setBrush(grad)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(cx, cy), r, r)
-
-        # Draw Grid with Soft Edges and Alpha Fade
+        # 1. Draw Grid (Existing Code)
         grid_w = self.grid_size * self.cell_size
         off_x = (self.width() - grid_w) / 2
         off_y = (self.height() - grid_w) / 2 
-        
         painter.setPen(Qt.PenStyle.NoPen)
-        center_idx = 1.5 # Center of a 4x4 grid is between indices 1 and 2
-
+        center_idx = 1.5 
         for r in range(self.grid_size):
             for c in range(self.grid_size):
                 rgb = self.current[r,c].astype(int)
                 col = QColor(*rgb)
-                
-                if self.flash_val > 0.1:
-                    col = col.lighter(int(100 + (self.flash_val * 60)))
-
-                # Calculate opacity based on distance from center (Neumorphic fade)
+                if self.flash_val > 0.1: col = col.lighter(int(100 + (self.flash_val * 60)))
                 dist = np.sqrt((r - center_idx)**2 + (c - center_idx)**2)
-                
-                # Alpha curve: Center cells ~200, Corners ~50
                 alpha = int(np.clip(240 - (dist * 80), 0, 255))
                 col.setAlpha(alpha)
-
                 x = off_x + c * self.cell_size
                 y = off_y + r * self.cell_size
-                
                 rect = QRectF(x + 1, y + 1, self.cell_size - 2, self.cell_size - 2)
-                
                 grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
                 grad.setColorAt(0, col)
-                
                 col_dark = col.darker(105)
-                col_dark.setAlpha(alpha) # Ensure gradient end matches alpha
+                col_dark.setAlpha(alpha)
                 grad.setColorAt(1, col_dark)
-                
                 painter.setBrush(grad)
                 painter.drawRoundedRect(rect, 3.0, 3.0)
+
+        # 2. Draw "Swap" text on hover (subtle)
+        if self.underMouse() and self.text_alpha < 0.2:
+            painter.setPen(QColor(100, 120, 140, 150))
+            f = QFont("Segoe UI", 8)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(self.rect().adjusted(0,0,0,-4), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter, "swap")
+
+        # 3. Draw Kit Number (fading in/out)
+        if self.text_alpha > 0.01:
+            painter.setOpacity(self.text_alpha)
+            f = QFont("Segoe UI", 12, QFont.Weight.Bold)
+            painter.setFont(f)
+            painter.setPen(QColor(40, 60, 80))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.kit_names[self.kit_index])
 
 class PlayButton(QPushButton):
     def __init__(self, parent=None):
@@ -642,8 +1131,12 @@ class StepPad(QWidget):
         self.is_playing_head = False
         self.flash_val = 0.0
         self.is_downbeat = (index % 4 == 0)
+
         self.setFixedWidth(28)
+        # Change Policy to FIXED horizontal, EXPANDING vertical.
+        # This prevents the pads from stretching wider than 28px.
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
 
@@ -824,6 +1317,994 @@ class DraggableLabel(QLabel):
             if fname:
                 self.file_dropped.emit(fname)
 
+class GradientLabel(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.phase = 0.0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start(50)
+        # Font size 12 to match DraggableLabel
+        self.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.setFixedWidth(55)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+    def animate(self):
+        self.phase = (self.phase + 0.02) % 1.0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        c1 = QColor.fromHslF(self.phase, 0.6, 0.7)
+        c2 = QColor.fromHslF((self.phase + 0.3) % 1.0, 0.6, 0.7)
+        grad.setColorAt(0, c1)
+        grad.setColorAt(1, c2)
+        
+        painter.setPen(QPen(QBrush(grad), 0))
+        # Adjust rect to match DraggableLabel margin
+        r = self.rect().adjusted(2, 0, 0, 0)
+        painter.drawText(r, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text)
+
+class PlaceholderButton(QPushButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Matches SlotRow.create_btn dimensions exactly
+        self.setFixedSize(30, 18)
+        
+        # Matches SlotRow.create_btn stylesheet exactly
+        self.setStyleSheet("""
+            QPushButton { 
+                background: white; 
+                border: 1px solid #cbd5e0; 
+                border-radius: 3px;
+                margin: 0px;
+                padding: 0px;
+            }
+        """)
+
+class ReseqWaveform(QWidget):
+    pattern_changed = pyqtSignal()
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, steps=STEPS, parent=None):
+        super().__init__(parent)
+        self.steps = steps
+        self.pattern = [False] * steps
+        self.velocities = [0.8] * steps
+        self.waveform_data = None
+        
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+        self.setFixedWidth(448)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        
+        self.play_step = -1
+        self.hover_step = -1
+        self.cached_poly = None
+        
+        # Interaction state
+        self.is_dragging = False
+        self.drag_start_y = 0
+        self.drag_state = True # What we are painting (True/False)
+        self.last_step_idx = -1
+        self.initial_vel_at_click = 0.8
+
+    def set_data(self, data):
+        if data is None: 
+            self.waveform_data = None
+            self.cached_poly = None
+        else:
+            target_width = 800
+            step = max(1, len(data) // target_width)
+            self.waveform_data = data[::step]
+            mx = np.max(np.abs(self.waveform_data))
+            if mx > 0: self.waveform_data /= mx
+            self.cached_poly = None
+        self.update()
+
+    def set_playing_step(self, step):
+        if self.play_step != step:
+            self.play_step = step
+            self.update()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls(): event.accept()
+        else: event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls: self.file_dropped.emit(urls[0].toLocalFile())
+
+    def mousePressEvent(self, event):
+        if self.waveform_data is None:
+            fname, _ = QFileDialog.getOpenFileName(self, "load sample", "", "Audio (*.wav *.mp3 *.flac)")
+            if fname: self.file_dropped.emit(fname)
+            return
+
+        w = self.width()
+        step_w = w / self.steps
+        idx = int(event.pos().x() / step_w)
+        
+        if 0 <= idx < self.steps:
+            # Toggle logic
+            self.pattern[idx] = not self.pattern[idx]
+            self.drag_state = self.pattern[idx]
+            
+            self.is_dragging = True
+            self.last_step_idx = idx
+            self.drag_start_y = event.pos().y()
+            self.initial_vel_at_click = self.velocities[idx]
+            
+            self.pattern_changed.emit()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        w = self.width()
+        step_w = w / self.steps
+        idx = int(event.pos().x() / step_w)
+        
+        # 1. Handle Hover Visuals
+        if idx != self.hover_step:
+            self.hover_step = idx
+            self.update()
+
+        # 2. Handle Interaction
+        if self.is_dragging and 0 <= idx < self.steps:
+            
+            # A. Horizontal Paint (New Step)
+            if idx != self.last_step_idx:
+                self.pattern[idx] = self.drag_state
+                # Reset vertical reference for the new step to current Y
+                self.drag_start_y = event.pos().y() 
+                self.initial_vel_at_click = self.velocities[idx]
+                self.last_step_idx = idx
+                self.pattern_changed.emit()
+            
+            # B. Vertical Velocity Drag (Current Step)
+            # Only adjust velocity if the step is Active
+            if self.pattern[idx]:
+                dy = self.drag_start_y - event.pos().y()
+                # Sensitivity: Full height = full range roughly
+                vel_delta = dy / 200.0 
+                new_vel = np.clip(self.initial_vel_at_click + vel_delta, 0.1, 1.0)
+                
+                if abs(new_vel - self.velocities[idx]) > 0.01:
+                    self.velocities[idx] = new_vel
+                    # No pattern_changed emit here to avoid re-generating audio constantly
+                    # But we need visual update
+                    self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.is_dragging = False
+        # Emit one final change for velocity updates
+        self.pattern_changed.emit()
+
+    def leaveEvent(self, event):
+        self.hover_step = -1
+        self.update()
+
+    def resizeEvent(self, event):
+        self.cached_poly = None
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        r = self.rect().adjusted(1, 1, -1, -1)
+        w, h = r.width(), r.height()
+        
+        # Background
+        painter.setBrush(QColor("#edf2f7"))
+        painter.setPen(QPen(QColor("#cbd5e0"), 1))
+        painter.drawRoundedRect(r, 3, 3)
+
+        if self.waveform_data is None:
+            painter.setPen(QColor("#a0aec0"))
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, "drag audio here")
+            return
+
+        # Generate Poly
+        if self.cached_poly is None and self.waveform_data is not None:
+            pts = []
+            cy = h / 2
+            amp = (h / 2) * 0.95  # Increased amplitude slightly
+            x_step = w / len(self.waveform_data)
+            
+            pts.append(QPointF(0, cy))
+            for i, val in enumerate(self.waveform_data):
+                pts.append(QPointF(i * x_step, cy + abs(val) * amp))
+            pts.append(QPointF(w, cy))
+            
+            for i in range(len(self.waveform_data)-1, -1, -1):
+                val = self.waveform_data[i]
+                pts.append(QPointF(i * x_step, cy - abs(val) * amp))
+            
+            self.cached_poly = QPolygonF(pts)
+
+        painter.save()
+        painter.translate(r.topLeft())
+
+        # Draw Full Gradient Waveform (Clipped to box)
+        if self.cached_poly:
+            path = QPainterPath()
+            path.addRoundedRect(0, 0, w, h, 3, 3)
+            painter.setClipPath(path)
+            
+            # UPDATED: More saturated gradient for better visibility
+            grad = QLinearGradient(0, 0, w, 0)
+            grad.setColorAt(0, QColor("#3182ce")) # Stronger Blue
+            grad.setColorAt(1, QColor("#805ad5")) # Stronger Purple
+            painter.setBrush(QBrush(grad))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(self.cached_poly)
+
+        step_w = w / self.steps
+        
+        # Draw Overlays
+        for i in range(self.steps):
+            x = i * step_w
+            is_active = self.pattern[i]
+            is_play = (i == self.play_step)
+            is_hover = (i == self.hover_step)
+            
+            rect = QRectF(x, 0, step_w, h)
+
+            if is_play:
+                # Playhead highlight
+                painter.setBrush(QColor(255, 255, 255, 120))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRect(rect)
+            elif not is_active:
+                # Inactive: Dim out the waveform significantly (higher alpha white)
+                # This creates high contrast between Active (Color) and Inactive (Pale)
+                painter.setBrush(QColor(240, 244, 248, 210))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRect(rect)
+                
+                if is_hover:
+                    painter.setBrush(QColor(255, 255, 255, 100))
+                    painter.drawRect(rect)
+            else:
+                # Active: Apply Saturation based on Velocity
+                # UPDATED: Adjusted range. High velocity = True Color. Low velocity = Washed out.
+                vel = self.velocities[i]
+                # Map 0.1->1.0 to Alpha 200->0
+                alpha = int((1.0 - vel) * 180) 
+                if alpha > 0:
+                    painter.setBrush(QColor(255, 255, 255, alpha))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawRect(rect)
+            
+            # Dividers
+            if i > 0:
+                painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+                painter.drawLine(int(x), 0, int(x), int(h))
+
+        painter.restore()
+
+class AnimToggle(QPushButton):
+    def __init__(self, text, anim_type='pulse', parent=None):
+        super().__init__(text, parent)
+        self.setCheckable(True)
+        self.setFixedSize(30, 18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.anim_type = anim_type
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(40)
+        self.phase = 0.0
+        
+        # Font settings EXACTLY match SlotRow (10px)
+        self.setStyleSheet("""
+            QPushButton { 
+                background: white; border: 1px solid #cbd5e0; border-radius: 3px;
+                margin: 0px; padding: 0px; color: #4a5568; 
+                font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
+            QPushButton:checked { border-color: #a0aec0; } 
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked(): return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        
+        self.phase += 0.15
+        if(self.phase > 100): self.phase = 0
+        
+        cx, cy = rect.center().x(), rect.center().y()
+
+        if self.anim_type == 'pulse':
+            # Purple Oscillation (Filter)
+            # Alpha oscillates between 40 and 120
+            alpha = int(80 + (np.sin(self.phase) * 40))
+            color = QColor(159, 122, 234, alpha) 
+            
+            grad = QRadialGradient(cx, cy, rect.width() * 0.6)
+            grad.setColorAt(0, color)
+            grad.setColorAt(1, QColor(255, 255, 255, 0))
+            
+            painter.setBrush(grad)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(rect, 3, 3)
+            
+        elif self.anim_type == 'ripple':
+            # Blue Ripple (Spatial)
+            # Sawtooth wave 0.0 -> 1.0
+            prog = (self.phase % 4.0) / 4.0
+            radius = prog * rect.width()
+            alpha = int((1.0 - prog) * 180)
+            
+            color = QColor(66, 153, 225, alpha)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            # Draw ellipse centered
+            painter.drawEllipse(QPointF(cx, cy), radius, radius * 0.6)
+
+class AnimRevButton(QPushButton):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setCheckable(True)
+        self.setFixedSize(30, 18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(25)
+        self.scan_pos = 1.0 # Start at Right (1.0)
+        
+        self.setStyleSheet("""
+            QPushButton { 
+                background: white; border: 1px solid #cbd5e0; border-radius: 3px;
+                margin: 0px; padding: 0px; color: #4a5568; 
+                font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
+        """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked(): return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        w, h = rect.width(), rect.height()
+
+        # Move Left (Right -> Left)
+        self.scan_pos -= 0.08
+        if self.scan_pos < -0.3: self.scan_pos = 1.0
+        
+        # Calculate visual X position
+        x_base = self.scan_pos * w
+
+        # Draw Trail (Behind the movement, so to the Right)
+        for i in range(4):
+            # i=0 is main line, i=1..3 are trails
+            lag_px = i * 2.5
+            x = x_base + lag_px
+            
+            # Clip
+            if x > w or x < 0: continue
+
+            alpha = 255 if i == 0 else int(160 - (i * 50))
+            if alpha < 0: alpha = 0
+            
+            pen = QPen(QColor(159, 122, 234, alpha)) # Purple
+            pen.setWidthF(1.5 if i == 0 else 1.0)
+            painter.setPen(pen)
+            
+            painter.drawLine(QPointF(x, 2), QPointF(x, h-2))
+
+class ReseqRow(QFrame):
+    pattern_changed = pyqtSignal()
+    preview_req = pyqtSignal(object)
+    saved_msg = pyqtSignal(str) 
+
+    def __init__(self, label_text, bpm_ref, parent=None):
+        super().__init__(parent)
+        self.label_text = label_text
+        self.bpm = bpm_ref 
+        
+        self.full_source_data = None 
+        self.raw_sample = None       
+        self.current_data = None     
+        
+        # FX States
+        self.is_reversed = False
+        self.mod_active = False
+        self.mod_envelopes = [] 
+        self.spatial_active = False
+        self.spatial_params = {}
+
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0) 
+        self.layout.setSpacing(0)
+
+        # Label Area
+        lbl_frame = QWidget()
+        lbl_frame.setFixedWidth(55)
+        lf_layout = QHBoxLayout(lbl_frame)
+        lf_layout.setContentsMargins(0,0,0,0)
+        self.lbl = GradientLabel(label_text)
+        self.lbl.clicked.connect(self.clear_sample)
+        self.lbl.setToolTip("Click to clear sample")
+        lf_layout.addWidget(self.lbl)
+        self.layout.addWidget(lbl_frame)
+
+        # Controls
+        ctrl_frame = QWidget()
+        ctrl_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        ctrl_main_layout = QHBoxLayout(ctrl_frame)
+        ctrl_main_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_main_layout.setSpacing(0)
+
+        # Button Container
+        btn_container = QWidget()
+        btn_container.setFixedWidth(65)
+        btn_grid = QGridLayout(btn_container)
+        btn_grid.setContentsMargins(0, 0, 4, 0)
+        btn_grid.setSpacing(1)
+        btn_grid.setVerticalSpacing(1)
+        
+        self.btn_snap = self.create_btn("snp", checkable=False)
+        self.btn_snap.setToolTip("Random Snap to Transient")
+        self.btn_snap.clicked.connect(self.snap_to_transient)
+        
+        # Replaced with custom AnimRevButton
+        self.btn_rev = AnimRevButton("rev", parent=self)
+        self.btn_rev.setToolTip("Reverse Loop")
+        self.btn_rev.toggled.connect(self.toggle_reverse)
+        
+        # Animated Toggles
+        self.btn_mod = AnimToggle("flt", anim_type='pulse', parent=self)
+        self.btn_mod.setToolTip("Filter Mod")
+        self.btn_mod.toggled.connect(self.toggle_mod)
+        
+        self.btn_space = AnimToggle("del", anim_type='ripple', parent=self)
+        self.btn_space.setToolTip("Reverb/Delay")
+        self.btn_space.toggled.connect(self.toggle_spatial)
+
+        btn_grid.addWidget(self.btn_snap, 0, 0)
+        btn_grid.addWidget(self.btn_rev, 0, 1)
+        btn_grid.addWidget(self.btn_mod, 1, 0)
+        btn_grid.addWidget(self.btn_space, 1, 1)
+        
+        btn_grid.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        ctrl_main_layout.addWidget(btn_container)
+
+        # Sliders
+        crush_container = QWidget()
+        cc_layout = QHBoxLayout(crush_container)
+        cc_layout.setContentsMargins(2, 0, 2, 0)
+        cc_layout.setSpacing(2)
+        
+        def make_v_slider(val, tip, handler, hue_offset, def_val=50):
+            sl = CircleSlider(Qt.Orientation.Vertical, base_hue=(260 + hue_offset) % 360, default_value=def_val)
+            sl.setRange(0, 100)
+            sl.setValue(val)
+            sl.setFixedWidth(20)
+            sl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            sl.setToolTip(tip)
+            sl.valueChanged.connect(handler)
+            return sl
+
+        self.sl_crush = make_v_slider(0, "Bitcrush", self.on_fx_change, 0, def_val=0)
+        self.sl_filt = make_v_slider(50, "Filter", self.on_fx_change, 8, def_val=50)
+        self.sl_pitch = make_v_slider(50, "Pitch", self.on_fx_change, 16, def_val=50)
+        self.sl_decay = make_v_slider(50, "Gate/Decay", self.on_fx_change, 24, def_val=50)
+        self.sl_tone = make_v_slider(50, "Tone", self.on_fx_change, 32, def_val=50)
+
+        cc_layout.addWidget(self.sl_crush)
+        cc_layout.addWidget(self.sl_filt)
+        cc_layout.addWidget(self.sl_pitch)
+        cc_layout.addWidget(self.sl_decay)
+        cc_layout.addWidget(self.sl_tone)
+        ctrl_main_layout.addWidget(crush_container)
+        self.layout.addWidget(ctrl_frame)
+
+        # Waveform
+        self.wave_viz = ReseqWaveform(STEPS, self)
+        self.wave_viz.file_dropped.connect(self.load_sample)
+        self.wave_viz.pattern_changed.connect(lambda: self.pattern_changed.emit())
+        self.layout.addWidget(self.wave_viz)
+
+        self.btn_clr = ClearButton(self)
+        self.btn_clr.clicked.connect(self.clear)
+        self.layout.addSpacing(6)
+        self.layout.addWidget(self.btn_clr)
+        self.layout.addStretch(1)
+
+    def create_btn(self, text, checkable=False):
+        b = QPushButton(text)
+        b.setFixedSize(30, 18)
+        b.setCheckable(checkable)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Font settings EXACTLY match SlotRow (10px)
+        b.setStyleSheet("""
+            QPushButton { 
+                background: white; border: 1px solid #cbd5e0; border-radius: 3px;
+                margin: 0px; padding: 0px; color: #4a5568; 
+                font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
+            QPushButton:checked { background: #e9d8fd; color: #6b46c1; border-color: #b794f4; }
+        """)
+        return b
+    
+    def clear(self):
+        """Fixes AttributeError by ensuring clear method exists"""
+        self.wave_viz.pattern = [False] * STEPS
+        self.pattern_changed.emit()
+        self.wave_viz.update()
+    
+    def highlight(self, idx):
+        self.wave_viz.set_playing_step(idx)
+    
+    def update_sound(self, play=False):
+        self.process_audio()
+        if play and self.current_data is not None:
+            self.preview_req.emit(self.current_data)
+    
+    @property
+    def pattern(self): return self.wave_viz.pattern
+    
+    @property
+    def velocities(self): return self.wave_viz.velocities
+
+    def load_sample(self, path):
+        try:
+            data, f_sr = sf.read(path)
+            if len(data.shape) > 1: data = np.mean(data, axis=1)
+            
+            # Robust Resampling with Padding
+            if f_sr != SR:
+                ratio = SR / f_sr
+                # Pad to avoid edge artifacts during FFT resample
+                pad_amt = 4096 
+                padded = np.pad(data, pad_amt, mode='reflect')
+                new_len = int(len(padded) * ratio)
+                
+                resampled = signal.resample(padded, new_len)
+                
+                # Crop back
+                crop_idx = int(pad_amt * ratio)
+                data = resampled[crop_idx : -crop_idx]
+
+            # Ensure strict zero crossings at start/end of loaded file
+            # This prevents the initial pop when looping the raw data later
+            if len(data) > 300:
+                # Fade in/out edges with Sine curve (smoother than linear)
+                fade_len = 150
+                curve = 0.5 * (1.0 - np.cos(np.linspace(0, np.pi, fade_len)))
+                data[:fade_len] *= curve
+                data[-fade_len:] *= curve[::-1]
+
+            # Normalization
+            peak = np.max(np.abs(data))
+            if peak > 0: data /= peak
+            
+            self.full_source_data = data.astype(np.float32)
+
+            self.saved_msg.emit(f"reseq: {path.split('/')[-1]}")
+            self.snap_to_transient()
+            
+        except Exception as e:
+            print(e)
+            self.saved_msg.emit("err loading sample")
+
+    def get_zero_crossing(self, data, idx, search_range=2000):
+        """Helper to find nearest zero crossing to avoid clicks"""
+        if data is None or idx < 0 or idx >= len(data): return idx
+        
+        start = max(0, idx - search_range)
+        end = min(len(data), idx + search_range)
+        
+        # Get slice
+        sub = data[start:end]
+        if len(sub) < 2: return idx
+        
+        # Find zero crossings (sign change)
+        zcs = np.where(np.diff(np.sign(sub)))[0]
+        
+        if len(zcs) > 0:
+            # Return absolute index of closest crossing
+            nearest = zcs[np.argmin(np.abs(zcs - (idx - start)))]
+            return start + nearest
+        return idx
+
+    def apply_mod_filter(self, audio_data):
+        """Applies per-step filter modulation (The 'flt' button)"""
+        if not self.mod_active or not self.mod_envelopes or len(audio_data) == 0:
+            return audio_data
+
+        # We process the audio in slices corresponding to the sequencer steps
+        step_len = len(audio_data) // STEPS
+        if step_len < 10: return audio_data
+
+        processed_chunks = []
+        
+        for i in range(STEPS):
+            # 1. Extract Chunk
+            start = i * step_len
+            # Handle last chunk rounding to ensure full length
+            end = (i + 1) * step_len if i < STEPS - 1 else len(audio_data)
+            chunk = audio_data[start:end]
+            
+            if len(chunk) == 0: continue
+
+            # 2. Get Params for this step
+            env = self.mod_envelopes[i]
+            # We apply a static filter per-step based on the average freq
+            # (Sweeping per-sample in Python is too slow for real-time)
+            freq = (env['start'] + env['end']) * 0.5
+            freq = np.clip(freq, 50, 16000)
+            
+            # 3. Design Filter
+            try:
+                if env['type'] == 'lp':
+                    sos = signal.butter(2, freq, 'lp', fs=SR, output='sos')
+                elif env['type'] == 'hp':
+                    sos = signal.butter(2, freq, 'hp', fs=SR, output='sos')
+                else: # bp
+                    width = freq * 0.5
+                    sos = signal.butter(2, [max(20, freq - width), min(SR/2-1, freq + width)], 'bp', fs=SR, output='sos')
+                
+                # 4. Apply
+                chunk = signal.sosfilt(sos, chunk)
+            except:
+                pass # Safety catch
+                
+            processed_chunks.append(chunk)
+
+        return np.concatenate(processed_chunks)
+
+    def snap_to_transient(self):
+        """Top Left Button: ◴ - Finds a transient and creates a seamless 1-bar loop"""
+        if self.full_source_data is None: return
+
+        # 1. DC Offset & Pre-processing
+        sos_dc = signal.butter(1, 20, 'hp', fs=SR, output='sos')
+        clean_source = signal.sosfilt(sos_dc, self.full_source_data)
+
+        # 2. Transient Detection
+        min_dist = int((60.0 / self.bpm) / 4.0 * SR)
+        peaks, _ = signal.find_peaks(np.abs(clean_source), height=0.05, distance=min_dist)
+
+        if len(peaks) > 0:
+            start_idx = peaks[np.random.randint(len(peaks))]
+        else:
+            start_idx = np.random.randint(0, max(1, len(clean_source) - 1000))
+
+        # 3. Exact Bar Length
+        bar_len_samples = int((60.0 / self.bpm) * 4.0 * SR)
+        
+        # 4. Construct Loop (With Wrapping)
+        out_buffer = np.zeros(bar_len_samples, dtype=np.float32)
+        source_len = len(clean_source)
+        curr_read_pos = start_idx
+        samples_left = bar_len_samples
+        write_pos = 0
+
+        while samples_left > 0:
+            can_read = min(samples_left, source_len - curr_read_pos)
+            chunk = clean_source[curr_read_pos : curr_read_pos + can_read]
+            out_buffer[write_pos : write_pos + len(chunk)] = chunk
+            
+            samples_left -= len(chunk)
+            write_pos += len(chunk)
+            curr_read_pos += len(chunk)
+            if curr_read_pos >= source_len: curr_read_pos = 0
+
+        # 5. De-Click / Fade Edges
+        fade_len = 200
+        if len(out_buffer) > fade_len * 2:
+            out_buffer[:fade_len] *= np.linspace(0, 1, fade_len)
+            out_buffer[-fade_len:] *= np.linspace(1, 0, fade_len)
+
+        # 6. Soft Limit
+        out_buffer = np.tanh(out_buffer * 1.5)
+        peak = np.max(np.abs(out_buffer))
+        if peak > 0: 
+            out_buffer /= peak
+            out_buffer *= 0.95
+
+        self.raw_sample = out_buffer.astype(np.float32)
+        
+        # --- CRACKLE FIX: Jitter Decay Slider ---
+        # This forces a fresh parameter update event, clearing any stale buffer states
+        current_decay = self.sl_decay.value()
+        jitter = np.random.randint(-3, 4) # -3 to +3 change
+        new_decay = np.clip(current_decay + jitter, 5, 95)
+        self.sl_decay.setValue(new_decay)
+
+        # Visual Feedback
+        self.btn_snap.setStyleSheet("""
+            QPushButton { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #E9D8FD, stop:1 #B794F4);
+                color: white; border: 1px solid #9F7AEA; border-radius: 3px; 
+            }
+        """)
+        QTimer.singleShot(150, lambda: self.btn_snap.setStyleSheet("""
+            QPushButton { background: white; border: 1px solid #cbd5e0; border-radius: 3px; color: #4a5568; font-size: 10px; font-weight: bold; }
+            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
+        """))
+
+        self.process_audio()
+        self.wave_viz.set_data(self.current_data)
+        self.pattern_changed.emit()
+
+    def toggle_reverse(self, state):
+        self.is_reversed = state
+        self.on_fx_change()
+
+    def toggle_mod(self, state):
+        self.mod_active = state
+        if state:
+            self.mod_envelopes = []
+            for i in range(STEPS):
+                # Weighted probability. 
+                # 50% Lowpass, 40% Bandpass, 10% Highpass.
+                # This prevents the sound from getting too thin too often.
+                f_type = np.random.choice(['lp', 'bp', 'hp'], p=[0.5, 0.4, 0.1])
+                
+                # If it IS a Highpass, cap the frequency at 3000Hz.
+                # (Previous limit was 6000Hz, which cut too much bass).
+                if f_type == 'hp':
+                    f_start = np.random.uniform(200, 3000)
+                    f_end = np.random.uniform(200, 3000)
+                else:
+                    f_start = np.random.uniform(200, 7000)
+                    f_end = np.random.uniform(200, 7000)
+
+                self.mod_envelopes.append({
+                    'type': f_type, 'start': f_start, 'end': f_end,
+                    'q': 0.7 + (np.random.random() * 0.5)
+                })
+        self.on_fx_change()
+
+    def toggle_spatial(self, state):
+        self.spatial_active = state
+        if state:
+            sync_opts = [0.25, 0.5, 0.75, 1.0]
+            mult = sync_opts[np.random.randint(len(sync_opts))]
+            self.spatial_params = {
+                'delay_mult': mult,
+                'feedback': np.random.uniform(0.3, 0.6),
+                'reverb_mix': np.random.uniform(0.15, 0.35)  # Increased mix for more noticeable effect
+            }
+        self.on_fx_change()
+  
+    def clear_sample(self):
+        self.full_source_data = None
+        self.raw_sample = None
+        self.current_data = None
+        self.wave_viz.set_data(None)
+        self.pattern_changed.emit()
+        self.saved_msg.emit("reseq: sample cleared")
+
+    def on_fx_change(self):
+        # Clear cached processed data to force fresh processing
+        self.current_data = None
+        self.process_audio()
+        self.pattern_changed.emit()
+    
+    def drift_params(self, amount):
+        if amount <= 0.01: return
+        # Logic to drift sliders slightly (Evolve Slider Feature)
+        targets = [self.sl_crush, self.sl_filt, self.sl_decay, self.sl_tone]
+        for sl in targets:
+            if not hasattr(sl, '_f_val'): sl._f_val = float(sl.value())
+            if not hasattr(sl, '_vel'): sl._vel = np.random.uniform(-0.05, 0.05)
+            # Push towards center if at edges
+            force = (np.random.random() - 0.5) * 0.04 * amount
+            if sl._f_val < 10: force += 0.03 * amount
+            elif sl._f_val > 90: force -= 0.03 * amount
+            sl._vel += force
+            sl._vel *= 0.985
+            new_val = sl._f_val + sl._vel
+            sl._f_val = np.clip(new_val, 0.0, 100.0)
+            if int(sl._f_val) != sl.value(): sl.setValue(int(sl._f_val))
+
+    def evolve_fx_params(self):
+        # Called at the start of every bar to evolve the internal FX engines
+        changed = False
+        
+        # 1. Evolve Filter Mod (Drift envelope frequencies)
+        if self.mod_active:
+            for env in self.mod_envelopes:
+                drift = np.random.uniform(0.9, 1.1)
+                env['start'] = np.clip(env['start'] * drift, 80, 14000)
+                env['end'] = np.clip(env['end'] * drift, 80, 14000)
+            changed = True
+        
+        # 2. Evolve Spatial (Drift Feedback/Mix)
+        if self.spatial_active:
+            fb_drift = np.random.uniform(-0.04, 0.04)
+            self.spatial_params['feedback'] = np.clip(self.spatial_params['feedback'] + fb_drift, 0.2, 0.75)
+            mix_drift = np.random.uniform(-0.03, 0.03)
+            self.spatial_params['reverb_mix'] = np.clip(self.spatial_params['reverb_mix'] + mix_drift, 0.05, 0.45)
+            changed = True
+            
+        if changed:
+            self.on_fx_change()
+    
+    def update_bpm(self, new_bpm):
+        self.bpm = new_bpm
+        if self.full_source_data is not None:
+            self.snap_to_transient()
+        else:
+            self.process_audio()
+    
+    def apply_background_reverb(self, audio_data):
+        """Apply subtle background reverb to entire reseq output"""
+        if len(audio_data) == 0:
+            return audio_data
+        
+        # Simple room reverb simulation
+        room_size = int(SR * 0.1)  # 100ms room
+        if room_size >= len(audio_data):
+            return audio_data
+        
+        wet = np.zeros_like(audio_data)
+        
+        # Early reflections
+        early_delays = [int(SR * 0.02), int(SR * 0.035), int(SR * 0.05)]
+        for delay in early_delays:
+            if delay < len(audio_data):
+                delayed = np.roll(audio_data, delay)
+                delayed[:delay] = 0
+                wet += delayed * 0.3
+        
+        # Late reverb (simple feedback delay)
+        late_delay = int(SR * 0.08)
+        if late_delay < len(audio_data):
+            for i in range(3):
+                delayed = np.roll(wet, late_delay)
+                delayed[:late_delay] = 0
+                wet = wet + (delayed * 0.4)
+        
+        # High-pass to avoid mud
+        sos_hp = signal.butter(2, 400, 'hp', fs=SR, output='sos')
+        wet = signal.sosfilt(sos_hp, wet)
+        
+        # Mix with dry signal (subtle - 15% wet)
+        result = (audio_data * 0.85) + (wet * 0.15)
+        
+        # Normalize
+        peak = np.max(np.abs(result))
+        if peak > 0.9:
+            result = result * (0.5 / peak)
+        
+        return result.astype(np.float32)
+    
+    def apply_spatial_effects(self, audio_data):
+        """Applies Delay/Reverb ('del') AND the subtle background texture"""
+        if len(audio_data) == 0: return audio_data
+        
+        mix = self.spatial_params.get('reverb_mix', 0.3)
+        feedback = self.spatial_params.get('feedback', 0.5)
+        delay_seconds = (60.0 / self.bpm) * self.spatial_params.get('delay_mult', 0.5)
+        
+        # --- 1. Subtle Background Reverb ---
+        wet_bg = np.zeros_like(audio_data)
+        offsets = [int(SR * 0.01), int(SR * 0.025), int(SR * 0.04)]
+        
+        for off in offsets:
+            if off < len(audio_data):
+                rolled = np.roll(audio_data, off)
+                rolled[:off] = 0 
+                wet_bg += rolled
+        
+        sos_hp = signal.butter(1, 300, 'hp', fs=SR, output='sos')
+        # CHANGE: Increased gain from 0.25 -> 0.5 (Twice as loud)
+        wet_bg = signal.sosfilt(sos_hp, wet_bg) * 0.5 
+        
+        # --- 2. Heavy Delay/Space ---
+        wet_delay = np.zeros_like(audio_data)
+        d_samples = int(delay_seconds * SR)
+        
+        if d_samples > 0 and d_samples < len(audio_data):
+            d1 = np.roll(audio_data, d_samples)
+            d1[:d_samples] = 0
+            
+            d2_samp = int(d_samples * 2)
+            d2 = np.zeros_like(audio_data)
+            if d2_samp < len(audio_data):
+                d2 = np.roll(audio_data, d2_samp)
+                d2[:d2_samp] = 0
+            
+            # Mix echoes
+            raw_delay = (d1 * feedback) + (d2 * (feedback * 0.9))
+            sos_lp = signal.butter(1, 4000, 'lp', fs=SR, output='sos')
+            wet_delay = signal.sosfilt(sos_lp, raw_delay)
+
+        total = audio_data + wet_bg + (wet_delay * mix * 1.6)
+        
+        return total
+    
+    def process_audio(self):
+        if self.raw_sample is None: 
+            return
+        
+        working_audio = self.raw_sample.copy()
+        
+        # 1. Reverse
+        if self.is_reversed:
+            working_audio = working_audio[::-1]
+
+        # 2. Pitch (Resample)
+        # Center (50) = 1.0x speed. 0 = 0.5x, 100 = 1.5x
+        p_pitch = self.sl_pitch.value() / 100.0
+        if abs(p_pitch - 0.5) > 0.02:
+            speed = 0.5 + (p_pitch * 1.5) 
+            new_len = max(100, int(len(working_audio) / speed))
+            working_audio = signal.resample(working_audio, new_len)
+
+        # 3. Tone (Tilt EQ)
+        # Low values = Dark (Lowpass), High values = Bright (Highpass)
+        p_tone = self.sl_tone.value() / 100.0
+        if p_tone < 0.45:
+            cutoff = 400 + (p_tone * 8000)
+            sos = signal.butter(1, cutoff, 'lp', fs=SR, output='sos')
+            working_audio = signal.sosfilt(sos, working_audio)
+        elif p_tone > 0.55:
+            cutoff = 100 + ((p_tone - 0.5) * 4000)
+            sos = signal.butter(1, cutoff, 'hp', fs=SR, output='sos')
+            working_audio = signal.sosfilt(sos, working_audio)
+
+        # 4. Mod Filter (Toggle Button)
+        if self.mod_active:
+            working_audio = self.apply_mod_filter(working_audio)
+
+        # 5. Global Filter (Slider)
+        filt_val = self.sl_filt.value() / 100.0
+        working_audio = SynthEngine.apply_filter(working_audio, filt_val)
+        
+        # 6. Decay (Volume Envelope)
+        # Acts as a "Gate" or fade out for the loop
+        p_decay = self.sl_decay.value() / 100.0
+        if p_decay < 0.95:
+            # Create a fade curve
+            t = np.linspace(0, 1, len(working_audio))
+            # decay coef: low slider = sharp fade out
+            coef = 0.5 + ((1.0 - p_decay) * 8.0) 
+            env = np.exp(-t * coef)
+            working_audio = working_audio * env
+
+        # 7. Bitcrush
+        crush = self.sl_crush.value() / 100.0
+        working_audio = SynthEngine.resample_lofi(working_audio, crush)
+        
+        # 8. Spatial Effects
+        if self.spatial_active:
+            working_audio = self.apply_spatial_effects(working_audio)
+        
+        # 9. Limiter
+        peak = np.max(np.abs(working_audio))
+        if peak > 0.95:
+            working_audio = working_audio * (0.95 / peak)
+            
+        self.current_data = working_audio.astype(np.float32)
+
 class SlotRow(QFrame):
     pattern_changed = pyqtSignal()
     preview_req = pyqtSignal(object)
@@ -834,7 +2315,6 @@ class SlotRow(QFrame):
         self.label_text = label_text
         self.drum_type = drum_type
         
-        # Audio Data State
         self.original_data = None    
         self.current_data = None     
         self.raw_sample = None       
@@ -870,40 +2350,68 @@ class SlotRow(QFrame):
 
         # --- Controls ---
         ctrl_frame = QWidget()
-        ctrl_layout = QHBoxLayout(ctrl_frame)
-        ctrl_layout.setContentsMargins(0, 0, 4, 0)
-        ctrl_layout.setSpacing(2) 
+        ctrl_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        
+        # Main layout for the control block (Buttons | Sliders)
+        ctrl_main_layout = QHBoxLayout(ctrl_frame)
+        ctrl_main_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_main_layout.setSpacing(0)
+
+        # 1. Button Grid Container (Fixed Width: 65px)
+        btn_container = QWidget()
+        btn_container.setFixedWidth(65)
+        
+        # Grid for the 4 buttons
+        btn_grid = QGridLayout(btn_container)
+        btn_grid.setContentsMargins(0, 0, 4, 0) # 4px right padding
+        btn_grid.setSpacing(1)                   # 1px gap between buttons
+        btn_grid.setVerticalSpacing(1)           # Tight vertical spacing
+        
+        # Create Buttons
         self.btn_wav = self.create_btn("wav")
         self.btn_wav.clicked.connect(self.export_one)
-        ctrl_layout.addWidget(self.btn_wav)
+        
         self.btn_vel = self.create_btn("vel")
         self.btn_vel.clicked.connect(self.randomize_velocity)
-        ctrl_layout.addWidget(self.btn_vel)
+        
         self.btn_rnd = self.create_btn("rnd")
         self.btn_rnd.clicked.connect(self.syncopate_gentle)
-        ctrl_layout.addWidget(self.btn_rnd)
         
-        # FX Container (Sliders)
+        self.btn_low = self.create_btn("low")
+        self.btn_low.clicked.connect(self.lower_velocity)
+        
+        # Add to Grid (Compact 2x2)
+        btn_grid.addWidget(self.btn_wav, 0, 0)
+        btn_grid.addWidget(self.btn_vel, 0, 1)
+        btn_grid.addWidget(self.btn_rnd, 1, 0)
+        btn_grid.addWidget(self.btn_low, 1, 1)
+        
+        # Center the grid vertically
+        btn_grid.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        ctrl_main_layout.addWidget(btn_container)
+
+        # 2. Slider Container
         crush_container = QWidget()
         cc_layout = QHBoxLayout(crush_container)
-        cc_layout.setContentsMargins(2,0,2,0)
-        cc_layout.setSpacing(2) 
+        cc_layout.setContentsMargins(2, 0, 2, 0) # Matches Header Label Margins
+        cc_layout.setSpacing(2)                  # Matches Header Label Spacing
         
-        def make_v_slider(val, tip, handler, hue_offset):
-            # Pass the calculated hue to the slider
-            sl = CircleSlider(Qt.Orientation.Vertical, base_hue=(base_hue + hue_offset) % 360)
+        def make_v_slider(val, tip, handler, hue_offset, def_val=50):
+            sl = CircleSlider(Qt.Orientation.Vertical, base_hue=(base_hue + hue_offset) % 360, default_value=def_val)
             sl.setRange(0, 100)
             sl.setValue(val)
-            sl.setFixedSize(20, 60) 
+            sl.setFixedWidth(20) # Fixed width to match labels
+            sl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
             sl.setToolTip(tip)
             sl.valueChanged.connect(handler)
             return sl
 
-        self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change, 0)
-        self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change, 8)
-        self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change, 16)
-        self.sl_decay = make_v_slider(50, "Decay", self.on_synth_change, 24)
-        self.sl_tone = make_v_slider(30, "Tone", self.on_synth_change, 32)
+        self.sl_crush = make_v_slider(0, "Bitcrush", self.on_crush_change, 0, def_val=0)
+        self.sl_filt = make_v_slider(50, "Filter", self.on_crush_change, 8, def_val=50)
+        self.sl_pitch = make_v_slider(50, "Pitch", self.on_synth_change, 16, def_val=50)
+        self.sl_decay = make_v_slider(50, "Decay", self.on_synth_change, 24, def_val=50)
+        self.sl_tone = make_v_slider(30, "Tone", self.on_synth_change, 32, def_val=30)
 
         cc_layout.addWidget(self.sl_crush)
         cc_layout.addWidget(self.sl_filt)
@@ -911,7 +2419,7 @@ class SlotRow(QFrame):
         cc_layout.addWidget(self.sl_decay)
         cc_layout.addWidget(self.sl_tone)
         
-        ctrl_layout.addWidget(crush_container)
+        ctrl_main_layout.addWidget(crush_container)
         self.layout.addWidget(ctrl_frame)
 
         # --- Pads ---
@@ -926,42 +2434,40 @@ class SlotRow(QFrame):
         self.btn_clr.clicked.connect(self.clear)
         self.layout.addSpacing(6)
         self.layout.addWidget(self.btn_clr)
-        
-        self.layout.addStretch() 
+        self.layout.addStretch(1)
         self.update_sound()
 
+    def lower_velocity(self):
+        changed = False
+        for i in range(STEPS):
+            if self.pattern[i]:
+                # Lower by 0.15, clamp at 0.1
+                new_vel = max(0.1, self.velocities[i] - 0.15)
+                if abs(new_vel - self.velocities[i]) > 0.001:
+                    self.velocities[i] = new_vel
+                    self.pads[i].velocity = new_vel
+                    self.pads[i].update()
+                    changed = True
+        if changed: self.pattern_changed.emit()
+    
     def load_sample(self, file_path):
         try:
-            # 1. Read only metadata first to check length (optimization)
-            # or just read and slice immediately.
             data, file_sr = sf.read(file_path)
-
-            # Convert to mono if stereo
             if len(data.shape) > 1:
                 data = np.mean(data, axis=1)
-
-            # Keep only first 3 seconds
             max_samples = 3 * file_sr 
             if len(data) > max_samples:
                 data = data[:max_samples]
-
-            # Resample if mismatch
             if file_sr != SR:
                 num_samples = int(len(data) * SR / file_sr)
-                # Now resampling is fast because len(data) is small
                 data = signal.resample(data, num_samples)
-            
-            # Normalize
             peak = np.max(np.abs(data))
             if peak > 0: data = data / peak
-            
-            # Trim silence & declick
             data = SynthEngine.ensure_zero_crossing(data.astype(np.float32))
 
             self.raw_sample = data
             self.is_sample_mode = True
             
-            # Visual indication
             self.lbl.setStyleSheet("""
                 QLabel { color: #38a169; font-weight: bold; font-size: 12px; margin-left: 2px;} 
                 QLabel:hover { background-color: #f0fff4; }
@@ -971,6 +2477,9 @@ class SlotRow(QFrame):
             
             self.update_sound(play=True)
             
+            self.current_data = None  # Force reprocessing
+            self.process_audio()      # Process immediately
+        
         except Exception as e:
             self.saved_msg.emit("load err")
             print(f"Error loading: {e}")
@@ -1020,10 +2529,8 @@ class SlotRow(QFrame):
 
     def update_sound(self, play=False):
         if self.is_sample_mode and self.raw_sample is not None:
-            # Apply Pitch, Decay, Tone to the raw sample
             self.original_data = SynthEngine.process_sample(self.raw_sample, self.synth_params)
         else:
-            # Generate fresh synth sound
             self.original_data = SynthEngine.generate_drum(self.drum_type, self.synth_params)
             
         self.process_audio()
@@ -1038,11 +2545,9 @@ class SlotRow(QFrame):
     def process_audio(self):
         if self.original_data is None: return
         
-        # Apply Filter first
         filt_val = self.sl_filt.value() / 100.0
         filtered = SynthEngine.apply_filter(self.original_data, filt_val)
         
-        # Then Bitcrush
         crush = self.sl_crush.value() / 100.0
         self.current_data = SynthEngine.resample_lofi(filtered, crush)
 
@@ -1100,7 +2605,6 @@ class SlotRow(QFrame):
     def export_one(self):
         if self.current_data is None: return
         
-        # --- Directory Setup ---
         home_dir = os.path.expanduser("~")
         save_dir = os.path.join(home_dir, "Music", "sequa")
         
@@ -1110,7 +2614,6 @@ class SlotRow(QFrame):
                 self.saved_msg.emit("err: cannot create folder")
                 return
 
-        # --- Save File ---
         timestamp = int(time.time())
         safe_name = self.label_text.replace(" ", "_")
         filename = f"{safe_name}_{timestamp}.wav"
@@ -1118,14 +2621,12 @@ class SlotRow(QFrame):
         
         try:
             sf.write(full_path, self.current_data, SR)
-            # Shortened message for the status bar
             self.saved_msg.emit(f"saved: Music/sequa/{filename}")
         except Exception as e:
             self.saved_msg.emit(f"err: {str(e)}")
 
     def drift_params(self, amount):
         if amount <= 0.01: return
-        # Pitch excluded so the beat stays in tune
         targets = [self.sl_crush, self.sl_filt, self.sl_decay, self.sl_tone]
         for sl in targets:
             if not hasattr(sl, '_f_val'): sl._f_val = float(sl.value())
@@ -1140,18 +2641,24 @@ class SlotRow(QFrame):
             if int(sl._f_val) != sl.value(): sl.setValue(int(sl._f_val))
 
 class CircleSlider(QSlider):
-    def __init__(self, orientation, base_hue=210, parent=None):
+    def __init__(self, orientation, base_hue=210, default_value=50, parent=None):
         super().__init__(orientation, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.default_value = default_value
         
         self.base_hue = base_hue
-        # Start at base hue
         self.current_hue = base_hue 
         self.color_1 = QColor.fromHsl(int(self.base_hue), 150, 160)
         self.color_2 = QColor.fromHsl(int((self.base_hue + 20) % 360), 180, 130)
         
-        # Random phase so sliders don't pulse in perfect unison
         self.phase = np.random.rand() * 10
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.setValue(self.default_value)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def tick_color(self):
         # Slower, discrete-ish oscillation around the base hue (+/- 15 degrees)
@@ -1159,7 +2666,6 @@ class CircleSlider(QSlider):
         hue_offset = np.sin(self.phase) * 15
         h = (self.base_hue + hue_offset) % 360
         
-        # Generate palette based on new hue
         self.color_1 = QColor.fromHsl(int(h), 160, 180)
         self.color_2 = QColor.fromHsl(int((h + 30) % 360), 180, 140)
         self.update()
@@ -1194,7 +2700,7 @@ class CircleSlider(QSlider):
             
             # Handle
             painter.setBrush(QColor("white"))
-            painter.setPen(QPen(self.color_1, 1)) # Use dynamic color for border
+            painter.setPen(QPen(self.color_1, 1)) 
             painter.drawEllipse(QPointF(x, cy), handle_r, handle_r)
             
         else:
@@ -1294,20 +2800,47 @@ class StatusWidget(QWidget):
         text_rect = rect.adjusted(10, 0, -5, 0) 
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text)
 
+class HeaderParamLabel(QLabel):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, text, param_key, parent=None):
+        super().__init__(text, parent)
+        self.param_key = param_key
+        self.setFixedWidth(20) # Match slider width
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Default: Gray
+        self.base_style = "font-size: 9px; font-weight: bold; color: #718096;"
+        self.setStyleSheet(self.base_style)
+
+    def enterEvent(self, event):
+        # Hover: Lighter saturation (Soft Blue)
+        self.setStyleSheet("font-size: 9px; font-weight: bold; color: #63b3ed;")
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setStyleSheet(self.base_style)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.param_key)
+
 class SequaWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("sequa")
-        self.setFixedSize(760, 560) 
+        self.setFixedSize(760, 560)
         
         self.slots = []
         self.bpm = BPM_DEFAULT
         self.swing = 0.0
         self.clip_amount = 0.0
         self.evolve_amount = 0.0
-        self.reverse_prob = 0.0 # NEW: Reverse probability
+        self.reverse_prob = 0.0 # Reverse probability
         self.step = -1
         self.last_processed_step = -1
+        self.last_preview_time = 0
         
         # Color animation ticker
         self.anim_tick_counter = 0
@@ -1327,11 +2860,37 @@ class SequaWindow(QMainWindow):
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(5) 
         self.timer.timeout.connect(self.update_playhead)
+        self.timer.start() # <--- Start immediately, never stop
         
         self.setup_ui()
         self.update_mix()
         self.sink.start(self.gen)
-
+    
+    def change_kit(self, kit_idx):
+        # 1. Update Engine
+        kit_map = [SynthEngine.KIT_SIMPLE, SynthEngine.KIT_PCM, SynthEngine.KIT_EIGHT, SynthEngine.KIT_NINE]
+        SynthEngine.set_kit(kit_map[kit_idx])
+        
+        # 2. Regenerate all sounds (CPU calculation is safe to do rapidly)
+        for s in self.slots:
+            s.update_sound(play=False)
+            
+        # 3. Handle Audio Preview with Debounce
+        # Only touch the QAudioSink if enough time has passed (150ms)
+        now = time.time()
+        if self.slots and (now - self.last_preview_time > 0.15):
+            self.last_preview_time = now
+            
+            # Filter out ReseqRow to play only drums
+            drums = [s for s in self.slots if not isinstance(s, ReseqRow)]
+            if drums:
+                r_slot = drums[np.random.randint(len(drums))]
+                self.preview.play(r_slot.current_data)
+            
+        # 4. Show Notification
+        names = ["simple", "pcm", "eight", "nine"]
+        self.show_notification(f"kit loaded: {names[kit_idx]}")
+    
     def setup_ui(self):
         cw = QWidget()
         self.setCentralWidget(cw)
@@ -1345,9 +2904,10 @@ class SequaWindow(QMainWindow):
         header.setSpacing(10)
         header.setContentsMargins(0, 0, 0, 5)
         header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
+        
         # Logo - Added directly to header to prevent margin clipping
         self.logo = LogoWidget()
+        self.logo.kit_changed.connect(self.change_kit)
         # header.addWidget(self.logo) # We wrap it slightly to ensure left spacing if needed, but direct is safest:
         logo_cont = QWidget()
         logo_layout = QVBoxLayout(logo_cont)
@@ -1357,19 +2917,20 @@ class SequaWindow(QMainWindow):
         
         def setup_lbl(text):
             l = QLabel(text)
-            l.setFixedWidth(35) 
+            # Increased from 40 to 48 to fit "swing" comfortably
+            l.setFixedWidth(48) 
             l.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            l.setStyleSheet("color: #8592a3; font-weight: bold; font-size: 10px; margin-right: 4px;")
+            l.setStyleSheet("color: #4a5568; font-weight: bold; font-size: 12px; margin-right: 6px;")
             return l
 
-        def setup_slider(val, callback, hue):
-            sl = CircleSlider(Qt.Orientation.Horizontal, base_hue=hue)
+        def setup_slider(val, callback, hue, def_val=0):
+            sl = CircleSlider(Qt.Orientation.Horizontal, base_hue=hue, default_value=def_val)
             sl.setRange(0, 100)
             sl.setValue(val)
             sl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             sl.valueChanged.connect(callback)
             return sl
-
+        
         # --- Controls ---
         
         self.lbl_bpm = QLabel(f"bpm\n{self.bpm}")
@@ -1377,7 +2938,7 @@ class SequaWindow(QMainWindow):
         self.lbl_bpm.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.lbl_bpm.setStyleSheet("color: #676f7c; font-weight: bold; font-size: 11px; margin-right: 4px;")
         
-        self.sl_bpm = setup_slider(self.bpm, self.set_bpm, 180)
+        self.sl_bpm = setup_slider(self.bpm, self.set_bpm, 180, def_val=BPM_DEFAULT)
         self.sl_bpm.setRange(60, 200)
         self.sl_bpm.setToolTip(f"{self.bpm} BPM") 
         
@@ -1385,7 +2946,7 @@ class SequaWindow(QMainWindow):
         header.addWidget(self.sl_bpm)
 
         self.lbl_swg = setup_lbl("swing")
-        self.sl_swg = setup_slider(0, self.set_swing, 210)
+        self.sl_swg = setup_slider(0, self.set_swing, 210, def_val=0)
         self.sl_swg.sliderReleased.connect(self.update_mix) 
         header.addWidget(self.lbl_swg)
         header.addWidget(self.sl_swg)
@@ -1415,29 +2976,39 @@ class SequaWindow(QMainWindow):
         head_layout.setContentsMargins(0, 0, 0, 2)
         head_layout.setSpacing(0)
         
+        # 1. Match SlotRow Label Column
         lbl_space = QWidget()
-        lbl_space.setFixedWidth(55)
+        lbl_space.setFixedWidth(55) 
         head_layout.addWidget(lbl_space)
 
+        # 2. Match SlotRow Control Column
         ctrl_head = QWidget()
-        ch_layout = QHBoxLayout(ctrl_head)
-        ch_layout.setContentsMargins(0, 0, 4, 0)
-        ch_layout.setSpacing(2)
+        # Fixed Width = 65 (Buttons) + 112 (Sliders: 2 margin + 5*20 width + 4*2 spacing + 2 margin)
+        ctrl_head.setFixedWidth(177) 
         
+        ch_layout = QHBoxLayout(ctrl_head)
+        ch_layout.setContentsMargins(0, 0, 0, 0)
+        ch_layout.setSpacing(0)
+        
+        # 2a. Button Space
         btn_space = QWidget()
-        btn_space.setFixedWidth(94)
+        btn_space.setFixedWidth(65) 
         ch_layout.addWidget(btn_space)
         
+        # 2b. Label Container (Matches Slider Container)
         lbl_cont = QWidget()
         lc_layout = QHBoxLayout(lbl_cont)
-        lc_layout.setContentsMargins(2, 0, 2, 0)
+        lc_layout.setContentsMargins(2, 0, 2, 0) 
         lc_layout.setSpacing(2)
         
-        for txt in ["bit", "flt", "pch", "dec", "ton"]:
-            l = QLabel(txt)
-            l.setFixedWidth(18)
-            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l.setStyleSheet("font-size: 9px; font-weight: bold; color: #718096;")
+        # Use Clickable HeaderParamLabels
+        # Key maps to the attribute name of the slider in the rows
+        headers = [("bit", "sl_crush"), ("flt", "sl_filt"), ("pch", "sl_pitch"), 
+                   ("dec", "sl_decay"), ("ton", "sl_tone")]
+                   
+        for txt, key in headers:
+            l = HeaderParamLabel(txt, key)
+            l.clicked.connect(self.randomize_column)
             lc_layout.addWidget(l)
 
         ch_layout.addWidget(lbl_cont)
@@ -1457,6 +3028,13 @@ class SequaWindow(QMainWindow):
             r.saved_msg.connect(self.show_notification)
             main.addWidget(r) 
             self.slots.append(r)
+            
+            if l == "tom":
+                self.reseq = ReseqRow(" reseq", self.bpm)
+                self.reseq.pattern_changed.connect(self.update_mix)
+                self.reseq.saved_msg.connect(self.show_notification)
+                main.addWidget(self.reseq)
+                self.slots.append(self.reseq)
 
         # Footer
         bot = QHBoxLayout()
@@ -1509,6 +3087,10 @@ class SequaWindow(QMainWindow):
         self.sl_bpm.setToolTip(f"{v} BPM")
         self.lbl_bpm.setText(f"bpm\n{v}")
         
+        # Update Reseq row so it restretches audio
+        if hasattr(self, 'reseq'):
+            self.reseq.update_bpm(v)
+
         if self.gen.playing:
             loop_duration_old = (60.0 / self.bpm) * 4.0
             elapsed = time.perf_counter() - self.start_time
@@ -1547,8 +3129,14 @@ class SequaWindow(QMainWindow):
     def update_mix(self):
         slot_data = []
         for s in self.slots:
-            slot_data.append({'data': s.current_data, 'pattern': s.pattern, 'velocities': s.velocities})
-        # Pass reverse_prob to mix_sequence
+            is_sliced = isinstance(s, ReseqRow)
+            slot_data.append({
+                'data': s.current_data, 
+                'pattern': s.pattern, 
+                'velocities': s.velocities,
+                'is_sliced': is_sliced
+            })
+        
         self.gen.set_data(AudioMixer.mix_sequence(slot_data, self.bpm, self.swing, 
                                                   self.clip_amount, self.reverse_prob))
 
@@ -1558,18 +3146,17 @@ class SequaWindow(QMainWindow):
     def toggle_play(self):
         if self.gen.playing:
             self.gen.set_playback_state(False)
-            self.timer.stop()
+            # REMOVED: self.timer.stop() 
+            # The timer must keep running for UI animations (logo, buttons) to work while paused.
             self.btn_play.set_playing(False)
             self.reset_vis()
         else:
             self.gen.pos = 0 
             self.gen.set_playback_state(True)
             self.start_time = time.perf_counter()
-            self.timer.start()
             self.btn_play.set_playing(True)
             self.step = -1
             self.last_processed_step = -1
-            self.update_playhead()
 
     def update_playhead(self):
         self.logo.animate()
@@ -1579,52 +3166,83 @@ class SequaWindow(QMainWindow):
         if self.anim_tick_counter > 15: 
             self.anim_tick_counter = 0
             
+        if not self.gen.playing:
+            return
+            
             top_sliders = [self.sl_bpm, self.sl_swg, self.sl_clip, self.sl_evolve, self.sl_rev]
             for sl in top_sliders:
                 sl.tick_color()
 
             for s in self.slots:
-                s.sl_crush.tick_color()
-                s.sl_filt.tick_color()
-                s.sl_pitch.tick_color()
-                s.sl_decay.tick_color()
-                s.sl_tone.tick_color()
+                # Ensure we only tick sliders that actually exist on the object
+                if hasattr(s, 'sl_crush'): s.sl_crush.tick_color()
+                if hasattr(s, 'sl_filt'): s.sl_filt.tick_color()
+                if hasattr(s, 'sl_pitch'): s.sl_pitch.tick_color()
+                if hasattr(s, 'sl_decay'): s.sl_decay.tick_color()
+                if hasattr(s, 'sl_tone'): s.sl_tone.tick_color()
 
         # Update pads visually every frame
         for s in self.slots:
-            for p in s.pads:
-                if p.active: p.update()
+            if hasattr(s, 'pads'):
+                for p in s.pads:
+                    if p.active: p.update()
 
         if not self.gen.playing: return
 
-        # --- EVOLVE DRIFT ---
+        # --- EVOLVE DRIFT (SLIDERS) ---
         if self.evolve_amount > 0.01:
             for s in self.slots: 
-                s.drift_params(self.evolve_amount)
+                # Check for method existence to prevent crash on ReseqRow vs SlotRow differences
+                if hasattr(s, 'drift_params'):
+                    s.drift_params(self.evolve_amount)
 
-        # --- PLAYHEAD LOGIC (Restored) ---
+        # --- PLAYHEAD LOGIC ---
         loop_duration = (60.0 / self.bpm) * 4.0
         elapsed = time.perf_counter() - self.start_time
         current_step = int((elapsed % loop_duration) / loop_duration * STEPS)
         
         if current_step != self.step:
             self.step = current_step if current_step < STEPS else 0
-            # This triggers the dark playhead on the pads
+            
+            # --- RESEQ EVOLUTION TRIGGER ---
+            # Triggered exactly when the loop wraps back to step 0
+            if self.step == 0:
+                for s in self.slots:
+                    if hasattr(s, 'evolve_fx_params'):
+                        s.evolve_fx_params()
+
+            # Trigger the dark playhead on the pads
             for s in self.slots: s.highlight(self.step)
 
             if self.step != self.last_processed_step:
                 if self.evolve_amount > 0.05:
                     if np.random.random() < (self.evolve_amount * 0.3): 
-                        s_idx = np.random.randint(len(self.slots))
-                        slot = self.slots[s_idx]
-                        p_idx = np.random.randint(STEPS)
-                        new_state = not slot.pattern[p_idx]
-                        vel = slot.velocities[p_idx]
-                        slot.pads[p_idx].active = new_state
-                        slot.pads[p_idx].update()
-                        slot.update_step(p_idx, new_state, vel)
+                        # Filter for slots that have pads (Standard Slots)
+                        valid_slots = [s for s in self.slots if hasattr(s, 'pads')]
+                        if valid_slots:
+                            s_idx = np.random.randint(len(valid_slots))
+                            slot = valid_slots[s_idx]
+                            p_idx = np.random.randint(STEPS)
+                            new_state = not slot.pattern[p_idx]
+                            vel = slot.velocities[p_idx]
+                            slot.pads[p_idx].active = new_state
+                            slot.pads[p_idx].update()
+                            slot.update_step(p_idx, new_state, vel)
             
             self.last_processed_step = self.step
+    
+    def randomize_column(self, param_key):
+        """Randomizes the specific parameter for ALL slots"""
+        self.logo.trigger_flash() # Visual feedback
+        
+        for s in self.slots:
+            if hasattr(s, param_key):
+                slider = getattr(s, param_key)
+                # Generate unique random value per slot
+                new_val = np.random.randint(0, 101)
+                slider.setValue(new_val)
+                
+        self.show_notification(f"randomized: {param_key.replace('sl_', '')}")
 
     def reset_vis(self):
         self.step = -1
@@ -1667,7 +3285,6 @@ class SequaWindow(QMainWindow):
              QMessageBox.critical(self, "error", f"could not save: {e}")
 
 if __name__ == '__main__':
-    # 1. Fix Taskbar Icon for Windows
     try:
         myappid = 'sequa.audio.tool.v1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -1676,8 +3293,6 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
     
-    # 2. Set the Application Icon
-    # Resolves absolute path so the EXE finds the icon reliably
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sequa.ico")
     
     if os.path.exists(icon_path):
