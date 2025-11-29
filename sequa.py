@@ -714,8 +714,6 @@ class SynthEngine:
 
     @staticmethod
     def process_sample(raw_data, params):
-        # (Paste your existing process_sample logic here)
-        # It remains the same as before.
         if raw_data is None or len(raw_data) == 0:
             return np.zeros(100, dtype=np.float32)
 
@@ -762,7 +760,6 @@ class SynthEngine:
 
     @staticmethod
     def apply_filter(data, val):
-        # (Paste existing apply_filter)
         if 0.45 < val < 0.55: return data
         if val <= 0.45:
             norm = val / 0.45
