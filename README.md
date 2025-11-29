@@ -50,5 +50,4 @@ click the top left logo to swap kits.
 | snp | random snap |
 | rev | reverse |
 | flt | random filters |
-
 | del | random delays/reverb |
