@@ -20,9 +20,9 @@ click the top left logo to swap kits.
 
 **buttons**
 
-- wav - save    
-- vel  - velocity  
-- rnd - velocity/position
+- wav → save drum	    
+- vel  → velocity  
+- rnd → velocity/position
 - export loop
 - clear all
 
