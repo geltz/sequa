@@ -19,47 +19,37 @@ click the top left logo to swap kits.
 
 **buttons**
 
-- wav → save drum	    
-- vel  → random velocity  
-- rnd → random velocity/position
-- low → lower velocity		
-- export loop
-- clear all
+| button | action |
+| :--- | :--- |
+| wav | save drum |
+| vel | random velocity |
+| rnd | random velocity/position |
+| low | lower velocity |
+| export loop | export audio loop |
+| clear all | clear pattern |
 
 **sliders**  
 
-- bpm  
-- swing  
-- cut  
-- evo → evolve  
-- rev → reverse
-- bit → bitcrush   
-- flt → filter  
-- pch → pitch  
-- dec → decay  
-- ton → tone	
+| slider | effect |
+| :--- | :--- |
+| bpm | set tempo |
+| swing | add swing |
+| cut | cut |
+| evo | evolve |
+| rev | reverse |
+| bit | bitcrush |
+| flt | filter |
+| pch | pitch |
+| dec | decay |
+| ton | tone |
 
 **special**
 
-reseq → file cut-up sequence
+reseq - file cut-up sequence
 
-- snp → random snap
-- rev → reverse
-- flt → random filters
-- del → random delays/reverb
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+| feature | description |
+| :--- | :--- |
+| snp | random snap |
+| rev | reverse |
+| flt | random filters |
+| del | random delays/reverb |
