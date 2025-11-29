@@ -2,7 +2,7 @@
   <img src="icon.png" alt="sequa icon" width="100">
 </p>
 
-sequa is a generative drum machine and synthesis engine.	    
+sequa is a generative sequencer and drum synthesis engine.	    
 it lets you import your own sounds in-place by clicking/dragging on pad titles.    
 
 **controls**
@@ -51,3 +51,4 @@ click the top left logo to swap kits.
 | rev | reverse |
 | flt | random filters |
 | del | random delays/reverb |
+
