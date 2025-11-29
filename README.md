@@ -43,13 +43,12 @@ click the top left logo to swap kits.
 | dec | decay |
 | ton | tone |
 
-**special**
-
-reseq - file cut-up sequence
+**reseq**
 
 | feature | description |
 | :--- | :--- |
 | snp | random snap |
 | rev | reverse |
 | flt | random filters |
+
 | del | random delays/reverb |
