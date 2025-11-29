@@ -3,7 +3,6 @@
 </p>
 
 sequa is a generative drum machine and synthesis engine.	    
-
 it lets you import your own sounds in-place by clicking/dragging on pad titles.    
 
 **controls**
@@ -47,6 +46,7 @@ reseq → file cut-up sequence
 - rev → reverse
 - flt → random filters
 - del → random delays/reverb
+
 
 
 
