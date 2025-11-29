@@ -22,7 +22,7 @@ from PyQt6.QtMultimedia import QAudioSink, QAudioFormat, QMediaDevices
 SR = 44100
 BPM_DEFAULT = 120
 STEPS = 16
-BUFFER_MS = 90
+BUFFER_MS = 60
 
 # --- Audio Streaming ---
 
@@ -2991,7 +2991,7 @@ class SequaWindow(QMainWindow):
         header.addWidget(self.lbl_swg)
         header.addWidget(self.sl_swg)
 
-        self.lbl_clip = setup_lbl("clip")
+        self.lbl_clip = setup_lbl("cut")
         self.sl_clip = setup_slider(0, self.set_clip, 240)
         header.addWidget(self.lbl_clip)
         header.addWidget(self.sl_clip)
