@@ -23,6 +23,7 @@ click the top left logo to swap kits.
 - wav → save drum	    
 - vel  → velocity  
 - rnd → velocity/position
+- low → lower velocity		
 - export loop
 - clear all
 
@@ -46,6 +47,7 @@ reseq → file cut-up sequence
 - rev → reverse
 - flt → random filters
 - del → random delays/reverb
+
 
 
 
