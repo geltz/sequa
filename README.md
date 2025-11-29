@@ -41,11 +41,12 @@ click the top left logo to swap kits.
 
 **special**
 
-reseq → file cut-up sequence
+**reseq** → file cut-up sequence
 - snp → random snap
 - rev → reverse
 - flt → random filters
 - del → random delays/reverb
+
 
 
 
