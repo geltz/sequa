@@ -52,4 +52,5 @@ click the top left logo to swap kits.
 | flt | random filters |
 | del | random delays/reverb |
 
-[support me](https://ko-fi.com/geltz)
+this program is free but [donations are welcome](https://ko-fi.com/geltz)
+
