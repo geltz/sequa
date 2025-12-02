@@ -47,11 +47,12 @@ click the top left logo to swap kits.
 
 | feature | description |
 | :--- | :--- |
-| snp | random snap |
-| rev | reverse |
+| snp | snap to random transient |
+| rev | reverse playback |
 | flt | random filters |
 | del | random delays/reverb |
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
