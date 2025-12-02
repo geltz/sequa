@@ -45,7 +45,7 @@ click the top left logo to swap kits.
 
 **reseq**
 
-| feature | description |
+| button | action |
 | :--- | :--- |
 | snp | snap to random transient |
 | rev | reverse playback |
@@ -53,6 +53,7 @@ click the top left logo to swap kits.
 | del | random delays/reverb |
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
 
