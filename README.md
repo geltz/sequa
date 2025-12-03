@@ -29,7 +29,7 @@ it also allows import of custom sounds in-place.
 | low | lower velocity |
 | export | save stereo loop |
 | clear | clear pattern |
-| 1 / 2 | switch pattern bank |
+| 1 / 2 | switch pattern |
 
 **sliders**
 
@@ -59,5 +59,6 @@ it also allows import of custom sounds in-place.
 
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
