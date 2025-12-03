@@ -3285,21 +3285,41 @@ class SlotRow(QFrame):
         if changed: self.pattern_changed.emit()
 
     def syncopate_gentle(self):
+        # Determine offset based on what the pads are currently showing
+        # The main window updates pads[0].index when switching views
+        offset = self.pads[0].index
+        
         density = 0.35
         if "kick" in self.label_text: density = 0.25
         elif "hat" in self.label_text: density = 0.5
         elif "snare" in self.label_text: density = 0.2
         
-        for i in range(STEPS):
+        # Ensure capacity for the current view
+        target_len = offset + 16
+        while len(self.pattern) < target_len: self.pattern.append(False)
+        while len(self.velocities) < target_len: self.velocities.append(0.8)
+        
+        changed = False
+        
+        # Iterate only the visible 16 steps
+        for i in range(16):
+            real_idx = offset + i
+            
             is_active = np.random.random() < density
-            self.pattern[i] = is_active
+            self.pattern[real_idx] = is_active
+            
+            # Update the specific UI pad immediately
             self.pads[i].active = is_active
+            
             if is_active:
                 new_vel = np.random.uniform(0.4, 1.0)
-                self.velocities[i] = new_vel
+                self.velocities[real_idx] = new_vel
                 self.pads[i].velocity = new_vel
+            
             self.pads[i].update()
-        self.pattern_changed.emit()
+            changed = True
+            
+        if changed: self.pattern_changed.emit()
 
     def clear(self):
         for i in range(STEPS):
