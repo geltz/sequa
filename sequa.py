@@ -2549,8 +2549,9 @@ class ReseqRow(QFrame):
     
     def update_bpm(self, new_bpm):
         self.bpm = new_bpm
-        if self.full_source_data is not None: self.snap_to_transient()
-        else: self.process_audio()
+        # Re-process the current raw samples to match the new tempo
+        # (This generates the full 32-step buffer for both sides)
+        self.process_audio(steps=32)
     
     def apply_background_reverb(self, audio_data):
         if len(audio_data) == 0: return audio_data
@@ -3041,7 +3042,9 @@ class BassRow(QFrame):
         self.saved_msg.emit(f"bass: random ptn {side_num}")
 
     def update_bpm(self, new_bpm):
-        self.bpm = new_bpm; self.process_sequence()
+        self.bpm = new_bpm
+        # Re-generate the sequence at the new tempo
+        self.process_sequence(steps=32)
 
     def clear(self):
         self.piano.clear(); self.process_sequence()
