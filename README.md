@@ -30,7 +30,9 @@ drag audio files onto the reseq or drum labels to load samples.
 | clear | clear pattern |
 | 1 / 2 | switch pattern bank |
 
-**sliders** | slider | effect |
+**sliders**
+
+| slider | effect |
 | :--- | :--- |
 | bpm | set tempo |
 | swing | add swing |
@@ -53,5 +55,6 @@ drag audio files onto the reseq or drum labels to load samples.
 | rev | reverse playback |
 | flt | random filters |
 | del | random delays/reverb |
+
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
