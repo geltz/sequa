@@ -2,14 +2,15 @@
   <img src="icon2.png" alt="sequa icon" width="100">
 </p>
 
-sequa is a generative drum/bassline sequencer and sampling engine.	    
-it also allows import of custom sounds in-place.    
+sequa is a generative drum/bassline sequencer and sampling engine.	  	  
+it also allows import of custom sounds in-place.    	
 
 **controls**
 
-left/right mouse to add/remove pads and adjust velocity.  
-click the top left logo to swap kits.
-drag audio files onto the reseq or drum labels to load samples.
+left/right mouse to add/remove pads and adjust velocity.  	
+click the top left logo to swap kits.	
+load drum samples by clicking/dragging on drum pad titles.	
+load a main sample by dragging onto reseq band.	
 
 **kits**	
 	
@@ -58,3 +59,4 @@ drag audio files onto the reseq or drum labels to load samples.
 
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
