@@ -9,6 +9,7 @@ it also allows import of custom sounds in-place.
 
 left/right mouse to add/remove pads and adjust velocity.  
 click the top left logo to swap kits.
+drag audio files onto the reseq or drum labels to load samples.
 
 **kits**	
 	
@@ -21,27 +22,28 @@ click the top left logo to swap kits.
 
 | button | action |
 | :--- | :--- |
-| wav | save drum |
+| wav | save drum one-shot |
 | vel | random velocity |
 | rnd | random velocity/position |
 | low | lower velocity |
-| export loop | export audio loop |
-| clear all | clear pattern |
+| export | save stereo loop |
+| clear | clear pattern |
+| 1 / 2 | switch pattern bank |
 
-**sliders**  
-
-| slider | effect |
+**sliders** | slider | effect |
 | :--- | :--- |
 | bpm | set tempo |
 | swing | add swing |
 | cut | cut |
 | evo | evolve |
-| rev | reverse |
+| rev | reverse probability |
 | bit | bitcrush |
 | flt | filter |
 | pch | pitch |
 | dec | decay |
 | ton | tone |
+| rel | release (bass) |
+| gld | glide (bass) |
 
 **reseq**
 
@@ -53,12 +55,3 @@ click the top left logo to swap kits.
 | del | random delays/reverb |
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
-
-
-
-
-
-
-
-
-
