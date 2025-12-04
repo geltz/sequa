@@ -896,6 +896,7 @@ class AudioMixer:
         out = np.zeros(total_samples + int(SR * 0.5), dtype=np.float32)
         
         # 1. Generate Sidechain Map
+        # We keep global swing here so the ducking follows the Kick (which typically swings)
         sidechain_env = np.ones_like(out)
         for s in slots:
             if "kick" in s.get('label', ''):
@@ -922,13 +923,17 @@ class AudioMixer:
                 raw_data = np.nan_to_num(raw_data, copy=False)
                 is_sliced = s.get('is_sliced', False)
                 is_bass = s.get('is_bass', False) 
+                
+                # --- MINIMAL FIX: Decouple Reseq from Swing ---
+                # If it's a Reseq (sliced) track, force swing to 0. 
+                # Otherwise (Drums), use global swing.
+                current_swing = 0 if is_sliced else swing_offset
 
                 # === TRACK BUFFER ===
-                # We build the track in isolation first
                 track_out = np.zeros_like(out)
 
                 if is_bass:
-                    # Bass is pre-sequenced continuous audio, so we just apply sidechain immediately
+                    # Bass logic (Pre-sequenced)
                     write_len = min(len(raw_data), len(track_out))
                     bass_segment = raw_data[:write_len].copy()
                     bass_segment *= sidechain_env[:write_len]
@@ -940,7 +945,7 @@ class AudioMixer:
                     s_vels = s['velocities']
                     
                     if not is_sliced:
-                        # [One Shot Logic]
+                        # [One Shot Logic] (Drums)
                         max_seq_len = total_samples + int(SR * 0.5)
                         if clip_val > 0.0:
                             keep_ratio = 1.0 / (1.0 + (clip_val * 20.0))
@@ -965,7 +970,10 @@ class AudioMixer:
                             if i >= len(s_pattern): break
                             if s_pattern[i]:
                                 start_pos = int(i * sec_step * SR)
-                                if i % 2 != 0: start_pos += swing_offset
+                                
+                                # Apply Swing (Drum Logic)
+                                if i % 2 != 0: start_pos += current_swing
+                                
                                 if start_pos < len(track_out):
                                     current = data_rev if (rev_prob > 0.0 and np.random.random() < rev_prob) else data_fwd
                                     write_len = min(s_len, len(track_out) - start_pos)
@@ -974,8 +982,7 @@ class AudioMixer:
                                         gain = (s_vels[i] ** 1.5) * base_gain
                                         track_out[start_pos:start_pos + write_len] += current[:write_len] * gain
                     else:
-                        # [Reseq Logic]
-                        # We build the sequence first, THEN apply sidechain below
+                        # [Reseq Logic] (Sliced)
                         src_step_len = len(raw_data) // steps
                         if src_step_len < 100: continue 
 
@@ -985,14 +992,16 @@ class AudioMixer:
                                 src_start = i * src_step_len
                                 src_end = src_start + src_step_len
                                 dst_start = int(i * sec_step * SR)
-                                if i % 2 != 0: dst_start += swing_offset
+                                
+                                # Apply Swing (Reseq Logic - now 0 because current_swing is 0)
+                                if i % 2 != 0: dst_start += current_swing
+                                
                                 if src_end > len(raw_data): src_end = len(raw_data)
                                 if dst_start >= len(track_out): continue
 
                                 chunk = raw_data[src_start:src_end].copy()
                                 chunk *= (s_vels[i] ** 1.5)
                                 
-                                # Adaptive Fade
                                 fade_len = min(200, int(len(chunk) * 0.05))
                                 if fade_len > 4:
                                     chunk[:fade_len] *= np.linspace(0, 1, fade_len)
@@ -1004,11 +1013,8 @@ class AudioMixer:
 
                 # === APPLY FX Post-Sequence ===
                 if is_sliced:
-                    # [SIDECHAIN APPLIED HERE]
-                    # We multiply the finished Reseq track by the kick ducking envelope
+                    # Apply Sidechain (Duck the Reseq based on Kick)
                     track_out *= sidechain_env
-                    
-                    # We apply reverb to the CONTINUOUS track buffer.
                     track_out = SynthEngine.apply_background_reverb(track_out)
 
                 # Add to Main Mix
@@ -1338,7 +1344,6 @@ class ArrowButton(QPushButton):
     def __init__(self, direction, parent=None):
         super().__init__(parent)
         self.direction = direction # 'left' or 'right'
-        # Increased height to 22px to match labels
         self.setFixedSize(14, 22)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.hover_fader = HoverFader(self, speed_in=0.2, speed_out=0.1)
@@ -1351,50 +1356,63 @@ class ArrowButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.hover_fader.update()
         t = self.hover_fader.val
-        r = self.rect().adjusted(0, 0, -1, -1)
-
-        # Background/Border Logic
-        bg_col = QColor(255, 255, 255)
-        if t > 0.01: 
-            target = QColor("#ebf8ff")
-            bg_col = QColor(int(255+(target.red()-255)*t), int(255+(target.green()-255)*t), int(255+(target.blue()-255)*t))
         
-        border_col = QColor("#cbd5e0")
+        r = self.rect().adjusted(1, 1, -1, -1)
+
+        # Background
+        bg_col = QColor(255, 255, 255)
         if t > 0.01:
-             target_b = QColor("#90cdf4")
-             border_col = QColor(int(203+(144-203)*t), int(213+(205-213)*t), int(224+(244-224)*t))
+            bg_col = QColor(
+                int(255 + (235 - 255) * t),
+                int(255 + (248 - 255) * t),
+                int(255 + (255 - 255) * t)
+            )
+        
+        # Border
+        border_col = QColor(
+            int(203 + (144 - 203) * t),
+            int(213 + (205 - 213) * t),
+            int(224 + (244 - 224) * t)
+        )
 
         painter.setBrush(bg_col)
         painter.setPen(QPen(border_col, 1))
-        painter.drawRoundedRect(r, 2, 2)
+        painter.drawRoundedRect(r, 3, 3)
 
-        # Draw Arrow
+        # Arrow Color
         arrow_col = QColor("#9ba5b2")
         if t > 0.01:
-             target_a = QColor("#3182ce")
-             arrow_col = QColor(int(160+(49-160)*t), int(174+(130-174)*t), int(192+(206-192)*t))
+             r_t = int(160 + (49 - 160) * t)
+             g_t = int(174 + (130 - 174) * t)
+             b_t = int(192 + (206 - 192) * t)
+             arrow_col = QColor(r_t, g_t, b_t)
 
         painter.setBrush(arrow_col)
         painter.setPen(Qt.PenStyle.NoPen)
         
-        # Centering Logic
         cx, cy = r.center().x(), r.center().y()
         path = QPainterPath()
         
-        # Size radius (distance from center to edge of arrow)
         s_x = 2.0 
         s_y = 3.0
         
+        # --- VISUAL CENTERING FIX ---
+        # Geometric center of a triangle != Visual center (Centroid).
+        # We shift the arrow slightly towards its tip to center it optically.
+        opt_shift = 0.5 
+        
         if self.direction == 'left':
-            # Tip at left, Base at right
-            path.moveTo(cx - s_x, cy)           # Tip
-            path.lineTo(cx + s_x, cy - s_y)     # Top Base
-            path.lineTo(cx + s_x, cy + s_y)     # Bottom Base
+            # Tip is Left, Mass is Right. Shift Left.
+            cx -= opt_shift
+            path.moveTo(cx - s_x, cy)           
+            path.lineTo(cx + s_x, cy - s_y)     
+            path.lineTo(cx + s_x, cy + s_y)     
         else:
-            # Tip at right, Base at left
-            path.moveTo(cx + s_x, cy)           # Tip
-            path.lineTo(cx - s_x, cy - s_y)     # Top Base
-            path.lineTo(cx - s_x, cy + s_y)     # Bottom Base
+            # Tip is Right, Mass is Left. Shift Right.
+            cx += opt_shift
+            path.moveTo(cx + s_x, cy)           
+            path.lineTo(cx - s_x, cy - s_y)     
+            path.lineTo(cx - s_x, cy + s_y)     
             
         painter.drawPath(path)
 
@@ -1692,10 +1710,7 @@ class GradientLabel(QWidget):
         
         font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         self.setFont(font)
-        
-        # Fixed size matching DraggableLabel
         self.setFixedSize(46, 22)
-
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -1703,22 +1718,36 @@ class GradientLabel(QWidget):
         self.clicked.emit()
 
     def animate(self):
-        self.phase = (self.phase + 0.005) % 1.0
+        self.phase += 0.05
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
+        # Oscillate 0.0 to 1.0 smoothly
+        osc = (np.sin(self.phase) + 1.0) / 2.0
+        
+        # --- SUBTLE PALETTE LOGIC ---
+        # Hue Range: 220 (Blue) to 270 (Lavender/Purple)
+        # Saturation: 130 (Medium-Low for subtlety)
+        # Lightness: 180 (High for "Pale" look)
+        
+        h1 = 220 + (osc * 50) 
+        c1 = QColor.fromHsl(int(h1), 130, 180)
+        
+        # Second color slightly offset phase for gradient tilt
+        osc2 = (np.sin(self.phase + 0.5) + 1.0) / 2.0
+        h2 = 220 + (osc2 * 50)
+        c2 = QColor.fromHsl(int(h2), 130, 170)
+
         grad = QLinearGradient(0, 0, self.width(), 0)
-        c1 = QColor.fromHslF(self.phase, 0.6, 0.7)
-        c2 = QColor.fromHslF((self.phase + 0.3) % 1.0, 0.6, 0.7)
         grad.setColorAt(0, c1)
         grad.setColorAt(1, c2)
         
         painter.setPen(QPen(QBrush(grad), 0))
         
-        # Adjusted left +4 pixels to align with the drum labels above
+        # Left padding +4 to align with columns
         r = self.rect().adjusted(4, 0, 0, 0)
         painter.drawText(r, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text)
 
@@ -2089,42 +2118,93 @@ class AnimToggle(QPushButton):
         self.setFixedSize(30, 18)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.anim_type = anim_type
-        self.timer = QTimer(self); self.timer.timeout.connect(self.update); self.timer.start(40)
+        
+        # Use HoverFader for identical behavior to FadeButton
+        self.hover_fader = HoverFader(self, speed_in=0.2, speed_out=0.1)
+        
+        # Match font to FadeButton(is_small=True)
+        self.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        
+        # Internal animation timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(40)
         self.phase = 0.0
-        # FIX: Changed :checked border-color from #9ba5b2 (Grey) to #3182ce (Blue)
-        self.setStyleSheet("""
-            QPushButton { 
-                background: white; border: 1px solid #cbd5e0; border-radius: 3px;
-                margin: 0px; padding: 0px; color: #9ba5b2; 
-                font-size: 10px; font-weight: bold; font-family: 'Segoe UI';
-            }
-            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
-            QPushButton:checked { border-color: #3182ce; color: #3182ce; } 
-        """)
+
+    def enterEvent(self, e): self.hover_fader.enter()
+    def leaveEvent(self, e): self.hover_fader.leave()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.isChecked(): return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect(); self.phase += 0.15
-        cx, cy = rect.center().x(), rect.center().y()
+        
+        # 1. Update Hover Logic
+        self.hover_fader.update()
+        t = self.hover_fader.val
+        r = self.rect().adjusted(1, 1, -1, -1)
 
-        if self.anim_type == 'pulse':
-            alpha = int(80 + (np.sin(self.phase) * 40))
-            color = QColor(159, 122, 234, alpha) 
-            grad = QRadialGradient(cx, cy, rect.width() * 0.6)
-            grad.setColorAt(0, color); grad.setColorAt(1, QColor(255, 255, 255, 0))
-            painter.setBrush(grad); painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(rect, 3, 3)
+        # 2. Calculate Colors (Matching FadeButton Logic)
+        
+        # Background: White -> Light Blue
+        bg_col = QColor(255, 255, 255)
+        if t > 0.01:
+            bg_col = QColor(
+                int(255 + (235 - 255) * t),
+                int(255 + (248 - 255) * t),
+                int(255 + (255 - 255) * t)
+            )
+
+        # Border: Grey (#cbd5e0) -> Blue (#90cdf4 approx)
+        # Using FadeButton's math: 203->144, 213->205, 224->244
+        border_col = QColor(
+            int(203 + (144 - 203) * t),
+            int(213 + (205 - 213) * t),
+            int(224 + (244 - 224) * t)
+        )
+        
+        # Text: Grey (#a0aec0) -> Blue (#3182ce approx)
+        # Using FadeButton's math: 160->49, 174->130, 192->206
+        text_r = int(160 + (49 - 160) * t)
+        text_g = int(174 + (130 - 174) * t)
+        text_b = int(192 + (206 - 192) * t)
+        text_col = QColor(text_r, text_g, text_b)
+
+        # Override for Checked State
+        # Request: Border stays grey (default behavior unless hovering), Text becomes Blue
+        if self.isChecked():
+            # Force text color to Blue
+            text_col = QColor("#3182ce")
+            # Keep border logic dynamic (Grey if mouse out, Blue if mouse over)
             
-        elif self.anim_type == 'ripple':
-            prog = (self.phase % 4.0) / 4.0
-            radius = prog * rect.width()
-            alpha = int((1.0 - prog) * 180)
-            color = QColor(66, 153, 225, alpha)
-            painter.setPen(QPen(color, 2)); painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(cx, cy), radius, radius * 0.6)
+        # 3. Draw Base (Box + Text)
+        painter.setBrush(bg_col)
+        painter.setPen(QPen(border_col, 1))
+        painter.drawRoundedRect(r, 3, 3)
+        
+        painter.setPen(text_col)
+        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+
+        # 4. Draw Overlay Animation (Pulse/Ripple)
+        if self.isChecked():
+            self.phase += 0.15
+            cx, cy = self.rect().center().x(), self.rect().center().y()
+            rect = self.rect()
+
+            if self.anim_type == 'pulse':
+                alpha = int(80 + (np.sin(self.phase) * 40))
+                color = QColor(159, 122, 234, alpha) 
+                grad = QRadialGradient(cx, cy, rect.width() * 0.6)
+                grad.setColorAt(0, color); grad.setColorAt(1, QColor(255, 255, 255, 0))
+                painter.setBrush(grad); painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(rect.adjusted(1,1,-1,-1), 3, 3)
+                
+            elif self.anim_type == 'ripple':
+                prog = (self.phase % 4.0) / 4.0
+                radius = prog * rect.width()
+                alpha = int((1.0 - prog) * 180)
+                color = QColor(66, 153, 225, alpha)
+                painter.setPen(QPen(color, 2)); painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(cx, cy), radius, radius * 0.6)
 
 class AnimRevButton(QPushButton):
     def __init__(self, text, parent=None):
@@ -2132,33 +2212,83 @@ class AnimRevButton(QPushButton):
         self.setCheckable(True)
         self.setFixedSize(30, 18)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.timer = QTimer(self); self.timer.timeout.connect(self.update); self.timer.start(25)
+        
+        # Use HoverFader for identical behavior to FadeButton
+        self.hover_fader = HoverFader(self, speed_in=0.2, speed_out=0.1)
+        
+        # Match font to FadeButton(is_small=True)
+        self.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(25)
         self.scan_pos = 1.0 
-        self.setStyleSheet("""
-            QPushButton { 
-                background: white; border: 1px solid #cbd5e0; border-radius: 3px;
-                margin: 0px; padding: 0px; color: #9ba5b2; 
-                font-size: 10px; font-weight: bold; font-family: 'Segoe UI';
-            }
-            QPushButton:hover { background: #ebf8ff; color: #3182ce; border-color: #90cdf4; }
-            QPushButton:checked { color: #3182ce; }
-        """)
+
+    def enterEvent(self, e): self.hover_fader.enter()
+    def leaveEvent(self, e): self.hover_fader.leave()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.isChecked(): return
-        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect(); w, h = rect.width(), rect.height()
-        self.scan_pos -= 0.08
-        if self.scan_pos < -0.3: self.scan_pos = 1.0
-        x_base = self.scan_pos * w
-        for i in range(4):
-            x = x_base + (i * 2.5)
-            if x > w or x < 0: continue
-            alpha = 255 if i == 0 else int(160 - (i * 50))
-            if alpha < 0: alpha = 0
-            pen = QPen(QColor(159, 122, 234, alpha)); pen.setWidthF(1.5 if i == 0 else 1.0)
-            painter.setPen(pen); painter.drawLine(QPointF(x, 2), QPointF(x, h-2))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 1. Update Hover Logic
+        self.hover_fader.update()
+        t = self.hover_fader.val
+        r = self.rect().adjusted(1, 1, -1, -1)
+
+        # 2. Calculate Colors
+        bg_col = QColor(255, 255, 255)
+        if t > 0.01:
+            bg_col = QColor(
+                int(255 + (235 - 255) * t),
+                int(255 + (248 - 255) * t),
+                int(255 + (255 - 255) * t)
+            )
+
+        border_col = QColor(
+            int(203 + (144 - 203) * t),
+            int(213 + (205 - 213) * t),
+            int(224 + (244 - 224) * t)
+        )
+        
+        text_r = int(160 + (49 - 160) * t)
+        text_g = int(174 + (130 - 174) * t)
+        text_b = int(192 + (206 - 192) * t)
+        text_col = QColor(text_r, text_g, text_b)
+
+        if self.isChecked():
+            text_col = QColor("#3182ce")
+
+        # 3. Draw Base
+        painter.setBrush(bg_col)
+        painter.setPen(QPen(border_col, 1))
+        painter.drawRoundedRect(r, 3, 3)
+        
+        painter.setPen(text_col)
+        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+
+        # 4. Draw Overlay Animation (Scanline)
+        if self.isChecked():
+            w, h = self.width(), self.height()
+            self.scan_pos -= 0.08
+            if self.scan_pos < -0.3: self.scan_pos = 1.0
+            x_base = self.scan_pos * w
+            
+            # Clip to the button rect so lines don't bleed out
+            path = QPainterPath()
+            # FIX: Convert r (QRect) to QRectF explicitly
+            path.addRoundedRect(QRectF(r), 3, 3)
+            painter.setClipPath(path)
+            
+            for i in range(4):
+                x = x_base + (i * 2.5)
+                if x > w or x < 0: continue
+                alpha = 255 if i == 0 else int(160 - (i * 50))
+                if alpha < 0: alpha = 0
+                pen = QPen(QColor(159, 122, 234, alpha))
+                pen.setWidthF(1.5 if i == 0 else 1.0)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(x, 2), QPointF(x, h-2))
 
 class ReseqEngine:
     @staticmethod
@@ -2916,6 +3046,40 @@ class BassPianoRoll(QWidget):
             painter.setBrush(QColor(200, 210, 225, 40))
             painter.drawRect(QRectF(x, 0, step_w, h))
 
+class BassDisplayLabel(QWidget):
+    """Replacement for QLabel to ensure exact border/background matching with buttons."""
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.setFixedHeight(22)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # Font matching FadeButton (is_small=True)
+        self.font = QFont("Segoe UI", 7, QFont.Weight.Bold)
+
+    def setText(self, text):
+        self.text = text
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Match button adjustment
+        r = self.rect().adjusted(1, 1, -1, -1)
+        
+        # Static colors matching default button state
+        bg_col = QColor(255, 255, 255)
+        border_col = QColor("#cbd5e0")
+        text_col = QColor("#9ba5b2")
+        
+        painter.setBrush(bg_col)
+        painter.setPen(QPen(border_col, 1))
+        painter.drawRoundedRect(r, 3, 3)
+        
+        painter.setFont(self.font)
+        painter.setPen(text_col)
+        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text)
+
 class BassRow(QFrame):
     pattern_changed = pyqtSignal()
     preview_req = pyqtSignal(object)
@@ -2941,13 +3105,10 @@ class BassRow(QFrame):
         
         self.lbl = GradientLabel(" bass")
         self.lbl.clicked.connect(self.randomize_pattern)
-        
-        # Align Left (0 stretch)
         lf_layout.addWidget(self.lbl, 0, Qt.AlignmentFlag.AlignLeft)
-        
         self.layout.addWidget(lbl_frame)
-        # ---------------------------------
 
+        # Controls
         ctrl_frame = QWidget(); ctrl_frame.setFixedWidth(205)
         c_layout = QHBoxLayout(ctrl_frame); c_layout.setContentsMargins(0, 0, 0, 0); c_layout.setSpacing(0)
 
@@ -2955,28 +3116,25 @@ class BassRow(QFrame):
         bc_layout = QVBoxLayout(btn_container); bc_layout.setContentsMargins(0, 0, 4, 0)
         bc_layout.setSpacing(1); bc_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         
-        def make_display_lbl(txt):
-            l = QLabel(txt)
-            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l.setStyleSheet("font-size: 9px; font-weight: bold; color: #9ba5b2; background: white; border: 1px solid #cbd5e0; border-radius: 2px;")
-            # Increased height to 22px to match buttons and other labels
-            l.setFixedHeight(22)
-            return l
-
+        # --- Updated Row 1: Scale ---
         scale_row = QWidget(); sr_layout = QHBoxLayout(scale_row); sr_layout.setContentsMargins(0,0,0,0); sr_layout.setSpacing(1)
         self.btn_scale_prev = ArrowButton('left'); self.btn_scale_prev.clicked.connect(lambda: self.cycle_scale(-1))
-        self.lbl_scale = make_display_lbl(self.scale_keys[0])
+        # Use custom painting label
+        self.lbl_scale = BassDisplayLabel(self.scale_keys[0])
         self.btn_scale_next = ArrowButton('right'); self.btn_scale_next.clicked.connect(lambda: self.cycle_scale(1))
         sr_layout.addWidget(self.btn_scale_prev); sr_layout.addWidget(self.lbl_scale, 1); sr_layout.addWidget(self.btn_scale_next)
         
+        # --- Updated Row 2: Root ---
         root_row = QWidget(); rr_layout = QHBoxLayout(root_row); rr_layout.setContentsMargins(0,0,0,0); rr_layout.setSpacing(1)
         self.btn_root_prev = ArrowButton('left'); self.btn_root_prev.clicked.connect(lambda: self.cycle_root(-1))
-        self.lbl_root = make_display_lbl(self.roots[0])
+        # Use custom painting label
+        self.lbl_root = BassDisplayLabel(self.roots[0])
         self.btn_root_next = ArrowButton('right'); self.btn_root_next.clicked.connect(lambda: self.cycle_root(1))
         rr_layout.addWidget(self.btn_root_prev); rr_layout.addWidget(self.lbl_root, 1); rr_layout.addWidget(self.btn_root_next)
 
         bc_layout.addWidget(scale_row); bc_layout.addWidget(root_row); c_layout.addWidget(btn_container)
 
+        # Sliders
         slider_container = QWidget(); sc_layout = QHBoxLayout(slider_container); sc_layout.setContentsMargins(2, 0, 2, 0); sc_layout.setSpacing(2)
         def make_labeled_slider(val, label_txt, hue_offset, def_val=50, tooltip=""):
             container = QWidget(); container.setFixedWidth(20) 
@@ -2992,7 +3150,7 @@ class BassRow(QFrame):
         w_vol, self.sl_vol = make_labeled_slider(80, "vol", 0, 80, "Master Volume")
         w_rel, self.sl_release = make_labeled_slider(50, "rel", 0, 50, "Release")   
         w_flt, self.sl_tone = make_labeled_slider(60, "flt", 10, 50, "Filter")  
-        w_pch, self.sl_root_sl = make_labeled_slider(40, "pch", 20, 40, "Pitch")
+        w_pch, self.sl_root_sl = make_labeled_slider(50, "pch", 20, 50, "Pitch")
         w_dec, self.sl_decay = make_labeled_slider(50, "dec", 30, 50, "Decay")
         w_gld, self.sl_glide = make_labeled_slider(10, "gld", 40, 0, "Glide") 
 
@@ -3037,7 +3195,13 @@ class BassRow(QFrame):
         self.process_sequence(); self.saved_msg.emit(f"root: {root_name}")
 
     def process_sequence(self, steps=32, notify=True):      
-        octave_offset = 12 if self.sl_root_sl.value() > 60 else -12 if self.sl_root_sl.value() < 40 else 0
+        val = self.sl_root_sl.value()
+        if val < 16: octave_offset = -24
+        elif val < 36: octave_offset = -12
+        elif val > 84: octave_offset = 24
+        elif val > 64: octave_offset = 12
+        else: octave_offset = 0
+
         params = {
             'root_note': self.current_root_idx + octave_offset, 'glide': self.sl_glide.value() / 100.0,
             'decay': self.sl_decay.value() / 100.0, 'release': self.sl_release.value() / 100.0,
@@ -3050,7 +3214,6 @@ class BassRow(QFrame):
         raw = BassEngine.generate_sequence(self.piano.pattern, self.piano.values, self.bpm, params, steps=32)
         vol = (self.sl_vol.value() / 100.0) ** 2
 
-        # This prevents filter blowups from killing the Kick drum in the mixer
         self.current_data = np.nan_to_num(raw * vol, copy=False)
         
         if notify:
@@ -3058,24 +3221,18 @@ class BassRow(QFrame):
 
     def randomize_pattern(self):
         density = np.random.uniform(0.3, 0.6)
-        
-        # FIX 1: Target the currently visible bank (0 or 16)
         offset = self.piano.view_offset
         
-        # Ensure capacity
         while len(self.piano.pattern) < 32: self.piano.pattern.append(False)
         while len(self.piano.values) < 32: self.piano.values.append(0.5)
         while len(self.piano.note_levels) < 32: self.piano.note_levels.append(0.0)
 
         for i in range(16):
             idx = offset + i
-            
             is_active = (np.random.random() < density)
             self.piano.pattern[idx] = is_active
             
             if is_active:
-                # FIX 2: Restrict to 0-7 integer grid so they are always clickable
-                # (grid_row + 0.5) / 8.0 centers the value in the visual slot
                 grid_row = np.random.randint(0, 8)
                 val = (grid_row + 0.5) / 8.0
                 self.piano.values[idx] = val
@@ -3084,14 +3241,13 @@ class BassRow(QFrame):
                 self.piano.note_levels[idx] = 0.0
                 
         self.piano.update()
-        self.process_sequence(steps=32) # Ensure we process full length
+        self.process_sequence(steps=32)
         
         side_num = int(offset/16) + 1
         self.saved_msg.emit(f"bass: random ptn {side_num}")
 
     def update_bpm(self, new_bpm):
         self.bpm = new_bpm
-        # Re-generate the sequence at the new tempo
         self.process_sequence(steps=32)
 
     def clear(self):
@@ -3645,43 +3801,53 @@ class StatusWidget(QWidget):
         
         self.text = ""
         
-        # Internal timer for independent animation
+        # 1. Animation Timer (60FPS Fade)
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.animate)
-        self.anim_timer.setInterval(30) 
+        self.anim_timer.setInterval(16)
+        
+        # 2. Duration Timer (How long text stays)
+        # We keep a reference to stop it if a new message comes in
+        self.duration_timer = QTimer(self)
+        self.duration_timer.setSingleShot(True)
+        self.duration_timer.timeout.connect(self.start_fade_out)
         
         self.font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
         
-        # Fade Variables
         self.opacity = 0.0
         self.target_opacity = 0.0
         self.display_active = False
 
     def set_text(self, text):
+        # Reset everything immediately
+        self.duration_timer.stop()
+        
         self.text = text
         self.target_opacity = 1.0
         self.display_active = True
         
+        # Ensure animation is running
         if not self.anim_timer.isActive():
             self.anim_timer.start()
             
-        QTimer.singleShot(3000, lambda: self.trigger_fade_out(text))
+        # Restart duration (3 seconds)
+        self.duration_timer.start(3000)
         self.update()
 
-    def trigger_fade_out(self, match_text):
-        if self.text == match_text:
-            self.target_opacity = 0.0
+    def start_fade_out(self):
+        self.target_opacity = 0.0
 
     def animate(self):
-        # Linear Fade In/Out (More responsive/snappy)
-        step = 0.15 
+        # Linear Fade
+        step = 0.1
         
         if self.opacity < self.target_opacity:
             self.opacity = min(self.target_opacity, self.opacity + step)
         elif self.opacity > self.target_opacity:
             self.opacity = max(self.target_opacity, self.opacity - step)
 
-        if self.opacity <= 0.0 and self.target_opacity == 0.0:
+        if self.opacity <= 0.01 and self.target_opacity == 0.0:
+            self.opacity = 0.0
             self.display_active = False
             self.anim_timer.stop()
             self.update()
@@ -3691,15 +3857,12 @@ class StatusWidget(QWidget):
             self.update()
 
     def paintEvent(self, event):
-        if self.opacity <= 0.01: return
+        if self.opacity <= 0.0: return
         
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Calculate alpha (0-255) based on float opacity
         alpha = int(255 * self.opacity)
-        
-        # Set color with explicit alpha
         col = QColor("#747db8")
         col.setAlpha(alpha)
         
