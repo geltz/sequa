@@ -52,13 +52,14 @@ it also allows import of custom sounds in-place.
 
 | button | action |
 | :--- | :--- |
-| snp | snap to random transient |
+| fit | fit sample to length |
 | rev | reverse playback |
 | flt | random filters |
 | del | random delays/reverb |
 
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
 
