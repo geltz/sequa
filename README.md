@@ -9,8 +9,8 @@ it also allows import of custom sounds in-place.
 
 - left/right mouse to add/remove pads and adjust velocity.  	
 - click the top left logo to swap kits.	
-- load drum samples by clicking/dragging on drum pad titles.	
-- load a main sample by dragging onto reseq band.	
+- load drum samples by click/drag on drum pad titles.	
+- load a main sample by click/drag onto reseq band.	
 
 **kits**	
 	
@@ -59,6 +59,7 @@ it also allows import of custom sounds in-place.
 
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
 
