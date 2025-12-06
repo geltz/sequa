@@ -1,5 +1,5 @@
 <p>
-  <img src="icon2.png" alt="sequa icon">
+  <img src="icon2.png" alt="sequa icon" width="128">
 </p>
 
 sequa is a generative drum/bassline sequencer and sampling engine.	  
@@ -59,6 +59,7 @@ it also allows import of custom sounds in-place.
 
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
 
