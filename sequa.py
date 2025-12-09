@@ -62,21 +62,29 @@ class LoopGenerator(QIODevice):
     def readData(self, maxlen):
         with QMutexLocker(self.mutex):
             if not self.playing or not self.data:
-                # Return silence to prevent crackle of underlying buffer garbage
                 return b'\x00' * maxlen
 
             if maxlen % 2 != 0: maxlen -= 1
             total_size = len(self.data)
             if total_size == 0: return b'\x00' * maxlen
             
+            # Handle wrap-around with max 2 operations (no while loop)
+            # This minimizes the time we hold the GIL in the audio thread.
             chunk = b''
-            while len(chunk) < maxlen:
-                if self.pos >= total_size: self.pos = 0
-                remaining = total_size - self.pos
+            if self.pos >= total_size: self.pos = 0
+            
+            remaining = total_size - self.pos
+            if remaining >= maxlen:
+                # Simple case: plenty of data left
+                chunk = self.data[self.pos : self.pos + maxlen]
+                self.pos += maxlen
+            else:
+                # Wrap case: take end, then start from beginning
+                chunk = self.data[self.pos:]
                 needed = maxlen - len(chunk)
-                take = min(remaining, needed)
-                chunk += self.data[self.pos : self.pos + take]
-                self.pos += take
+                chunk += self.data[:needed]
+                self.pos = needed
+                
             return chunk
 
     def writeData(self, data): return 0
@@ -2350,10 +2358,16 @@ class ReseqEngine:
 
         # 6. Trance Gate (Dynamic Steps)
         p_decay = params.get('decay', 0.5)
-        if p_decay < 0.9:
+        
+        # Only apply gating if decay is noticeably low (< 0.4).
+        if p_decay < 0.4:
             gate_len = target_len // steps
             gate_env = np.ones(gate_len, dtype=np.float32)
-            tail = int(gate_len * (1.0 - p_decay))
+            
+            # Map 0.0-0.4 knob range to a 10%-90% fade tail
+            tail_ratio = 0.9 - (p_decay * 2.0) 
+            tail = int(gate_len * tail_ratio)
+            
             if tail > 0:
                 gate_env[-tail:] = np.linspace(1, 0, tail)
             
@@ -2529,17 +2543,16 @@ class ReseqRow(QFrame):
             sec_beat = 60.0 / self.bpm; sec_step = sec_beat / 4.0
             target_length = int(sec_step * 16 * SR)
             
-            clean_source = np.nan_to_num(source, copy=True)
+            clean_source = source 
             source_len = len(clean_source)
             
-            # 1. Transient Search (Randomized candidates restored)
+            # 1. Transient Search
             best_start = 0
             min_usable = int(SR * 0.05) 
             limit = source_len - min_usable
             
             if limit > 0:
                 max_energy = -1.0
-                # FIX: Restored randomization so the button actually does something different each click
                 for _ in range(8):
                     cand = np.random.randint(0, limit)
                     window = clean_source[cand : cand + 1024]
@@ -2548,47 +2561,54 @@ class ReseqRow(QFrame):
                         max_energy = energy
                         best_start = cand
                 
-                scan_start = max(0, best_start - 1000)
+                scan_start = max(0, best_start - 2000)
                 scan_window = clean_source[scan_start : best_start + 100]
-                zcs = np.where(np.diff(np.sign(scan_window)))[0]
-                if len(zcs) > 0:
-                    local_peak_idx = 1000 
-                    best_zc = zcs[np.argmin(np.abs(zcs - local_peak_idx))]
-                    best_start = scan_start + best_zc
+                if len(scan_window) > 0:
+                    zcs = np.where(np.diff(np.sign(scan_window)))[0]
+                    if len(zcs) > 0:
+                        best_zc = zcs[-1] 
+                        best_start = scan_start + best_zc
 
-            # 2. Extract Logic (Crossfade Loop)
-            remaining = source_len - best_start
+            # 2. Extract Logic (Handle Padding Correctly)
+            actual_content_len = 0
             
-            if remaining >= target_length:
+            if (source_len - best_start) >= target_length:
+                # Full fit
                 out_buffer = clean_source[best_start : best_start + target_length]
+                actual_content_len = target_length
             else:
+                # Needs padding (Source ends early)
                 chunk = clean_source[best_start:]
-                min_loop = int(SR * 0.05)
-                
-                if len(chunk) < min_loop:
-                    out_buffer = np.zeros(target_length, dtype=np.float32)
-                    out_buffer[:len(chunk)] = chunk
-                else:
-                    xfade_len = min(int(SR * 0.01), len(chunk) // 8)
-                    if xfade_len > 0:
-                        chunk[:xfade_len] *= np.linspace(0, 1, xfade_len)
-                        chunk[-xfade_len:] *= np.linspace(1, 0, xfade_len)
-                    
-                    repeats = (target_length // len(chunk)) + 2
-                    tiled = np.tile(chunk, repeats)
-                    out_buffer = tiled[:target_length]
+                out_buffer = np.zeros(target_length, dtype=np.float32)
+                to_fill = min(len(chunk), target_length)
+                out_buffer[:to_fill] = chunk[:to_fill]
+                actual_content_len = to_fill
 
-            # 3. Final Cleanup
-            out_buffer = np.nan_to_num(out_buffer)
-            sos_hp = signal.butter(1, 20, 'hp', fs=SR, output='sos')
-            out_buffer = signal.sosfilt(sos_hp, out_buffer)
+            # 3. SAFETY PROCESSING
+            # Ensure we own the memory to modify it
+            if np.shares_memory(out_buffer, clean_source):
+                out_buffer = out_buffer.copy()
+
+            # A. Remove DC Offset (Prevents pops when fading to zero)
+            # We only calculate mean on the actual content to avoid bias from zero-padding
+            if actual_content_len > 0:
+                dc_offset = np.mean(out_buffer[:actual_content_len])
+                out_buffer[:actual_content_len] -= dc_offset
+
+            # B. Apply Fades (Start AND End of content)
+            fade_len = 64
+            if actual_content_len > (fade_len * 2):
+                # Fade In (Start)
+                out_buffer[:fade_len] *= np.linspace(0, 1, fade_len)
+                
+                # Fade Out (End of CONTENT, not necessarily end of buffer)
+                # This fixes the click where Audio -> Silence padding happens
+                out_buffer[actual_content_len - fade_len : actual_content_len] *= np.linspace(1, 0, fade_len)
             
-            peak = np.max(np.abs(out_buffer))
-            if peak > 0.01: out_buffer *= (0.89 / peak)
-            
+            # 4. Final Commit
             self.raw_samples[side] = out_buffer.astype(np.float32)
             self.wave_viz.set_data(self.raw_samples[side])
-            self.process_audio()
+            self.schedule_update() 
             self.saved_msg.emit(f"fit sample to length")
             
         except Exception as e:
@@ -3937,9 +3957,9 @@ class SequaWindow(QMainWindow):
         
         self.timer = QTimer()
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(5) 
+        self.timer.setInterval(15) 
         self.timer.timeout.connect(self.update_playhead)
-        self.timer.start() 
+        self.timer.start()
         
         self.setup_ui()
         self.update_mix()
@@ -3955,7 +3975,7 @@ class SequaWindow(QMainWindow):
             drums = [s for s in self.slots if not isinstance(s, ReseqRow)]
             if drums:
                 r_slot = drums[np.random.randint(len(drums))]
-                # CHANGED: Lower volume for preview sample (0.5)
+                # Lower volume for preview sample (0.5)
                 self.preview.play(r_slot.current_data * 0.5)
         names = ["simple", "pcm", "eight", "nine"]
         self.show_notification(f"kit loaded: {names[kit_idx]}")
